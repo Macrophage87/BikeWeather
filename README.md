@@ -141,6 +141,35 @@ quarto render dc_bike_weather_report.qmd --execute-params params.yml
 | `show_alerts` | `true` | Include active NWS alerts |
 | `alert_email` | placeholder | Contact folded into the NWS API User-Agent |
 
+### On Posit Connect Cloud
+
+Connect Cloud has no `-P` UI — it injects **environment variables**, which the
+`parameters` cell reads. Set them under **Advanced settings → Configure
+variables → Add variable** when you publish, or later from the content's
+**Settings** page (they're encrypted and applied when Connect Cloud renders your
+repo). Each variable is `BIKE_` + the parameter name in upper case:
+
+| Env variable | Overrides | Example value |
+|---|---|---|
+| `BIKE_LOCATION_NAME` | `location_name` | `Boulder, CO` |
+| `BIKE_LAT`, `BIKE_LON` | `lat`, `lon` | `40.0150`, `-105.2705` |
+| `BIKE_TZ` | `tz` | `America/Denver` |
+| `BIKE_FORECAST_DAYS` | `forecast_days` | `3` |
+| `BIKE_UNITS` | `units` | `metric` |
+| `BIKE_HAVE_LIGHT` | `have_light` | `false` |
+| `BIKE_PREFERRED_HOURS` | `preferred_hours` | `6,10`  (or `none`) |
+| `BIKE_RIDE_HOURS` | `ride_hours` | `2` |
+| `BIKE_MODELS` | `models` | `gfs_seamless,ecmwf_ifs025`  (or `none` = all) |
+| `BIKE_SHOW_ALERTS` | `show_alerts` | `true` |
+| `BIKE_ALERT_EMAIL` | `alert_email` | `you@example.com` |
+
+Parsing notes: booleans accept `1/true/yes/on`; lists are comma-separated (or a
+JSON array), and `none` clears them. Anything you don't set keeps the default
+above. Precedence, later wins: **defaults → `BIKE_*` env vars → `-P` / params
+file**. This applies only when Connect Cloud renders the source (publish from
+GitHub or a source deploy); if you `quarto publish` locally rendered output, the
+values bake in at your local render and the Cloud variables aren't consulted.
+
 The scientific thresholds (WBGT, gust, and wet-bulb cutoffs) stay in the `.py`
 as advanced settings.
 

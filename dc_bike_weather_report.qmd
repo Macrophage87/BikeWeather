@@ -1,0 +1,253 @@
+---
+title: "Biking Weather Forecast"
+subtitle: "Multi-model ride planning"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "On this page"
+    theme: cosmo
+    embed-resources: true
+    fig-align: left
+    code-tools: true
+    code-fold: true
+  pdf:
+    toc: true
+    toc-depth: 2
+    documentclass: scrartcl
+    geometry: margin=1in
+    fig-align: center
+    fig-pos: "H"
+    colorlinks: true
+execute:
+  echo: false
+  warning: false
+jupyter: python3
+---
+
+<!--
+Render HTML:  quarto render dc_bike_weather_report.qmd --to html
+Render PDF:   quarto render dc_bike_weather_report.qmd --to pdf
+Both:         quarto render dc_bike_weather_report.qmd
+
+Requirements: pip install jupyter requests pandas numpy matplotlib
+PDF also needs LaTeX:  quarto install tinytex   (one time)
+Keep this .qmd next to dc_bike_weather.py (imported as the analysis engine).
+The setup chunk fetches live data from Open-Meteo + NWS, so it needs internet.
+
+Every knob lives in the `parameters` cell below and can be overridden at render
+time WITHOUT editing this file:
+
+  Single values on the command line:
+    quarto render dc_bike_weather_report.qmd -P units:metric -P forecast_days:1
+
+  Lists / several values via a YAML file (params.yml):
+    location_name: "Boulder, CO"
+    lat: 40.0150
+    lon: -105.2705
+    tz: "America/Denver"
+    units: metric
+    forecast_days: 3
+    preferred_hours: [6, 10]
+    models: [gfs_seamless, ecmwf_ifs025, icon_seamless, ecmwf_aifs025]
+  then:
+    quarto render dc_bike_weather_report.qmd --execute-params params.yml
+-->
+
+```{python}
+#| label: parameters
+#| tags: [parameters]
+# Defaults below describe Washington, DC. Override any of them at render time
+# with -P key:value or --execute-params file.yml (see the comment block above).
+location_name = "Washington, DC"
+lat = 38.9072
+lon = -77.0369
+tz = "America/New_York"
+forecast_days = 5          # 1 = today only; 2 = today + tomorrow; etc.
+units = "us"               # "us" -> degF, mph ; "metric" -> degC, km/h
+have_light = True          # riding after dark is fine -> only a small night penalty
+preferred_hours = [5, 9]   # no-darkness-penalty window [start, end); None disables
+ride_hours = 3             # length of the single headline "best ride window"
+models = None              # None = all models; or a list of Open-Meteo model ids
+show_alerts = True         # include active NWS alerts
+alert_email = "sjcieply@gmail.com"   # NWS asks API users for a contact
+```
+
+```{python}
+#| label: setup
+import os, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np, pandas as pd
+import dc_bike_weather as bw
+
+# Push the parameters from the cell above into the analysis engine. This sets
+# location, units, rider profile, model set, etc. and recomputes derived values.
+bw.configure(
+    location_name=location_name, lat=lat, lon=lon, tz=tz,
+    forecast_days=forecast_days, units=units, have_light=have_light,
+    preferred_hours=preferred_hours, ride_hours=ride_hours, models=models,
+    show_alerts=show_alerts, alert_email=alert_email,
+)
+
+FIGDIR = "report_figs"
+os.makedirs(FIGDIR, exist_ok=True)
+
+# One live fetch shared by the whole report.
+js = bw.fetch()
+panel = bw.to_panel(js)
+alerts = bw.fetch_alerts() if show_alerts else []
+days = bw.split_by_day(panel)
+n_models = len(panel)
+
+
+def table_html(idx, agg):
+    """Consensus-by-hour table as HTML, with the rating cell colour-coded."""
+    head, cells, rate_idx = bw.consensus_rows(idx, agg)
+    th = "".join(f"<th style='padding:3px 9px'>{h}</th>" for h in head)
+    rows = []
+    for row, ri in zip(cells, rate_idx):
+        tds = "".join(
+            f"<td style='padding:3px 9px;text-align:center'>{v}</td>" for v in row[:-1])
+        col = bw.RATING_COLORS[ri]
+        tds += (f"<td style='padding:3px 9px;text-align:center;background:{col};"
+                f"color:#111;font-weight:600'>{row[-1]}</td>")
+        rows.append(f"<tr>{tds}</tr>")
+    return ("<table style='border-collapse:collapse;font-size:0.85em;margin:0.4em 0'>"
+            f"<thead><tr style='background:#333;color:#fff'>{th}</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
+
+
+def save(fig, name):
+    path = os.path.join(FIGDIR, name)
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return path
+```
+
+```{python}
+#| label: intro
+#| output: asis
+units = f"{bw.TU}, {bw.WU}"
+day_names = " and ".join(bw.day_label(d).split(" \u00b7 ")[0].lower() for d, _ in days)
+profile = []
+if bw.HAVE_LIGHT:
+    profile.append("you ride with a powerful light")
+if bw.PREFERRED_HOURS:
+    profile.append(f"you often ride {bw.PREFERRED_HOURS[0]}:00\u2013{bw.PREFERRED_HOURS[1]}:00")
+prof = (" Recommendations assume " + " and ".join(profile) + ".") if profile else ""
+
+print(f"Hour-by-hour cycling conditions for **{location_name}**, comparing "
+      f"**{n_models} weather models** (physics + AI) for **{day_names}**. "
+      f"Units are {units}.{prof} Each day shows an at-a-glance suitability grid, "
+      f"the recommended ride window, a consensus table, and detailed temperature, "
+      f"storm and wind charts \u2014 plus a heat-stress (WBGT) or wind-chill panel "
+      f"on days when heat or cold is a concern.\n")
+```
+
+```{python}
+#| label: alerts
+#| output: asis
+if alerts:
+    rank = {"Extreme": 0, "Severe": 1, "Moderate": 2, "Minor": 3, "Unknown": 4}
+    ordered = sorted(alerts, key=lambda a: rank.get(a["severity"], 5))
+    kind = "important" if ordered[0]["severity"] in ("Extreme", "Severe") else "warning"
+    print(f"::: {{.callout-{kind} title='Active NWS alerts'}}")
+    for a in ordered:
+        print(f"- **{a['event']}** ({a['severity']}) \u2014 "
+              f"{bw.fmt_alert_window(a['onset'], a['ends'])}")
+    print(":::\n")
+```
+
+```{python}
+#| label: days
+#| output: asis
+for di_, (d, sub) in enumerate(days):
+    didx = sub[next(iter(sub))].index
+    sun = bw.sun_times(bw.LAT, bw.LON, d)
+    agg = bw.build_aggregates(sub)
+    bullets, win = bw.summarize(sub, didx, agg, sun)
+    label = bw.day_label(d)
+
+    if di_ > 0:                       # start each day on its own page
+        print("{{< pagebreak >}}\n")
+    print(f"\n## {label}\n")
+
+    # Headline recommendation (first bullet, minus the leading star).
+    print("::: {.callout-tip title='Recommended ride window'}")
+    print(bullets[0].replace("\u2605 ", "") + "\n")
+    print(":::\n")
+
+    # At-a-glance suitability grid.
+    p = save(bw.fig_heatmap(sub, didx, agg, sun, win), f"heat_{di_}.png")
+    print(f"![Hourly bikeability \u2014 each model vs the consensus]({p}){{width=100%}}\n")
+
+    # Narrative.
+    print("**What the models say**\n")
+    for b in bullets[1:]:
+        print(f"- {b}")
+    print()
+
+    # Consensus table: rich HTML for the web build, colour-coded image for PDF.
+    print("**Consensus every 3 hours**\n")
+    print('::: {.content-visible when-format="html"}')
+    print(table_html(didx, agg))
+    print(":::\n")
+    tp = save(bw.fig_table(didx, agg), f"table_{di_}.png")
+    print('::: {.content-visible when-format="pdf"}')
+    print(f"![]({tp}){{width=85%}}")
+    print(":::\n")
+
+    # Heat-stress (WBGT) view — shown only when heat is a concern.
+    hf = bw.heat_flags(didx, agg)
+    if hf["concern"]:
+        flag = hf["peak_flag"]
+        kind = "important" if flag in ("Red", "Black") else "warning"
+        wins = hf["windows"]
+        span = (f"; in the {flag} zone {wins[flag]}"
+                if wins.get(flag) else "")
+        print(f"::: {{.callout-{kind} title='Heat stress \u2014 {flag} flag'}}")
+        print(f"Peak WBGT **{bw.Td(hf['peak_wbgt_c']):.0f}{bw.TU}** ({flag}) "
+              f"around {bw.hm(hf['peak_hour'])}{span}.\n")
+        if hf["wetbulb_danger"]:
+            print(f"- **Wet-bulb reaches {bw.Td(hf['wetbulb_max_c']):.0f}{bw.TU}** "
+                  f"\u2014 sweat can barely cool you; treat any hard effort as dangerous.")
+        for r in hf["recommendations"]:
+            print(f"- {r}")
+        print(":::\n")
+        pw = save(bw.fig_wbgt(sub, didx, agg, label, sun), f"wbgt_{di_}.png")
+        print(f"![Heat stress (WBGT) against athletic flags]({pw}){{width=100%}}\n")
+
+    # Wind-chill view — shown only when cold is a concern.
+    cf = bw.cold_flags(didx, agg)
+    if cf["concern"]:
+        band = cf["band"]
+        kind = ("important" if band in ("Very cold", "Dangerous")
+                else "warning" if band == "Cold" else "note")
+        print(f"::: {{.callout-{kind} title='Wind chill \u2014 {band}'}}")
+        print(f"Feels-like low **{bw.Td(cf['min_wc_c']):.0f}{bw.TU}** ({band}) "
+              f"around {bw.hm(cf['min_hour'])}; wind makes it up to "
+              f"{bw.dTd(cf['max_gap_c']):.0f}{bw.TU} colder than the air.\n")
+        for r in cf["recommendations"]:
+            print(f"- {r}")
+        print(":::\n")
+        pwc = save(bw.fig_windchill(sub, didx, agg, label, sun), f"wchill_{di_}.png")
+        print(f"![Wind chill (feels-like) against frostbite risk]({pwc}){{width=100%}}\n")
+
+    # Detailed charts.
+    pt = save(bw.fig_thermal(sub, didx, agg, label, sun), f"therm_{di_}.png")
+    print(f"![Temperature, heat stress and UV]({pt}){{width=100%}}\n")
+    pc = save(bw.fig_conditions(sub, didx, agg, label, sun), f"cond_{di_}.png")
+    print(f"![Precipitation, storms and wind]({pc}){{width=100%}}\n")
+```
+
+## Methodology & data
+
+```{python}
+#| label: method
+#| output: asis
+print(bw.methodology_text() + "\n")
+print("\n*" + bw.methodology_src() + "*")
+```

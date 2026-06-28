@@ -1,0 +1,27 @@
+{
+    "id": "4E9BE705",
+    "path": "/cloud/project/dc_bike_weather_report.qmd",
+    "project_path": "dc_bike_weather_report.qmd",
+    "type": "quarto_markdown",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1782654372357.0,
+    "source_on_save": false,
+    "relative_order": 2,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "239,31",
+        "scrollLine": "235",
+        "quartoPreviewFormat": "pdf"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1782654418,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1782654418869,
+    "read_only": false,
+    "read_only_alternatives": []
+}

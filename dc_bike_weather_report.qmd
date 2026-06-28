@@ -54,25 +54,53 @@ time WITHOUT editing this file:
     models: [gfs_seamless, ecmwf_ifs025, icon_seamless, ecmwf_aifs025]
   then:
     quarto render dc_bike_weather_report.qmd --execute-params params.yml
+
+  On Posit Connect Cloud (which has no -P UI) set environment variables instead:
+    Advanced settings -> Configure variables -> Add variable   (at publish time),
+    or later from the content's Settings page. Use the BIKE_* names listed in the
+    cell below, e.g.  BIKE_UNITS = metric ,  BIKE_LOCATION_NAME = Boulder, CO ,
+    BIKE_MODELS = gfs_seamless,ecmwf_ifs025  (comma-separated; "none" = all models).
+    Precedence (later wins): defaults here  <  BIKE_* env vars  <  -P / params file.
 -->
 
 ```{python}
 #| label: parameters
 #| tags: [parameters]
-# Defaults below describe Washington, DC. Override any of them at render time
-# with -P key:value or --execute-params file.yml (see the comment block above).
-location_name = "Washington, DC"
-lat = 38.9072
-lon = -77.0369
-tz = "America/New_York"
-forecast_days = 5          # 1 = today only; 2 = today + tomorrow; etc.
-units = "us"               # "us" -> degF, mph ; "metric" -> degC, km/h
-have_light = True          # riding after dark is fine -> only a small night penalty
-preferred_hours = [5, 9]   # no-darkness-penalty window [start, end); None disables
-ride_hours = 3             # length of the single headline "best ride window"
-models = None              # None = all models; or a list of Open-Meteo model ids
-show_alerts = True         # include active NWS alerts
-alert_email = "sjcieply@gmail.com"   # NWS asks API users for a contact
+# Defaults below describe Washington, DC. They can be overridden two ways, in
+# order of precedence (later wins): BIKE_* environment variables (how Posit
+# Connect Cloud injects values), then -P / --execute-params at render time.
+import os, json
+
+def _env(k, d):                 # string
+    v = os.getenv(k); return v if v not in (None, "") else d
+def _envf(k, d):                # float
+    v = os.getenv(k); return float(v) if v not in (None, "") else d
+def _envi(k, d):                # int
+    v = os.getenv(k); return int(v) if v not in (None, "") else d
+def _envb(k, d):                # bool: 1/true/yes/on -> True
+    v = os.getenv(k)
+    return d if v in (None, "") else v.strip().lower() in ("1", "true", "yes", "on")
+def _envlist(k, d):             # "a,b,c" or JSON list, or "none" -> None
+    v = os.getenv(k)
+    if v in (None, ""): return d
+    v = v.strip()
+    if v.lower() == "none": return None
+    return json.loads(v) if v.startswith("[") else [x.strip() for x in v.split(",") if x.strip()]
+
+location_name = _env("BIKE_LOCATION_NAME", "Washington, DC")
+lat  = _envf("BIKE_LAT", 38.9072)
+lon  = _envf("BIKE_LON", -77.0369)
+tz   = _env("BIKE_TZ", "America/New_York")
+forecast_days = _envi("BIKE_FORECAST_DAYS", 2)    # 1 = today only; 2 = today + tomorrow
+units = _env("BIKE_UNITS", "us")                  # "us" -> degF, mph ; "metric" -> degC, km/h
+have_light = _envb("BIKE_HAVE_LIGHT", True)        # dark riding ok -> small night penalty only
+ride_hours = _envi("BIKE_RIDE_HOURS", 3)          # length of the headline "best ride window"
+show_alerts = _envb("BIKE_SHOW_ALERTS", True)     # include active NWS alerts
+alert_email = _env("BIKE_ALERT_EMAIL", "replace-with-your-email@example.com")
+
+_ph = _envlist("BIKE_PREFERRED_HOURS", [5, 9])    # "5,9" or "none"; [start, end) no-dark window
+preferred_hours = [int(x) for x in _ph] if _ph else None
+models = _envlist("BIKE_MODELS", None)            # "gfs_seamless,ecmwf_ifs025"; none/"" = all
 ```
 
 ```{python}

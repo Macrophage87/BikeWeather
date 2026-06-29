@@ -177,8 +177,8 @@ as advanced settings.
 
 ## What the report contains
 
-A short intro, an alerts callout (if any), then **one section per day, each
-starting on a new page**:
+A short intro, an alerts callout (if any), then **one section per day** — shown
+as tabs in the HTML version and as separate pages (one day per page) in the PDF:
 
 1. **Recommended ride window** — the single best block, light-aware.
 2. **Bikeability heatmap** — every model vs the consensus, hour by hour, with

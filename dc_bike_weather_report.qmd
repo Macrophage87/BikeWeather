@@ -192,6 +192,9 @@ if alerts:
 ```{python}
 #| label: days
 #| output: asis
+# Each day is a tab in the HTML build. In PDF a tabset has no meaning, so Quarto
+# renders the tabs as a sequence of sections instead — one day per page below.
+print("::: {.panel-tabset}\n")
 for di_, (d, sub) in enumerate(days):
     didx = sub[next(iter(sub))].index
     sun = bw.sun_times(bw.LAT, bw.LON, d)
@@ -199,8 +202,10 @@ for di_, (d, sub) in enumerate(days):
     bullets, win = bw.summarize(sub, didx, agg, sun)
     label = bw.day_label(d)
 
-    if di_ > 0:                       # start each day on its own page
-        print("{{< pagebreak >}}\n")
+    if di_ > 0:                       # PDF only: each day starts on a new page
+        print('::: {.content-visible when-format="pdf"}')
+        print("{{< pagebreak >}}")
+        print(":::\n")
     print(f"\n## {label}\n")
 
     # Headline recommendation (first bullet, minus the leading star).
@@ -269,6 +274,8 @@ for di_, (d, sub) in enumerate(days):
     print(f"![Temperature, heat stress and UV]({pt}){{width=100%}}\n")
     pc = save(bw.fig_conditions(sub, didx, agg, label, sun), f"cond_{di_}.png")
     print(f"![Precipitation, storms and wind]({pc}){{width=100%}}\n")
+
+print(":::\n")                        # close the day tabset
 ```
 
 ## Methodology & data

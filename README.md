@@ -162,6 +162,9 @@ repo). Each variable is `BIKE_` + the parameter name in upper case:
 | `BIKE_MODELS` | `models` | `gfs_seamless,ecmwf_ifs025`  (or `none` = all) |
 | `BIKE_SHOW_ALERTS` | `show_alerts` | `true` |
 | `BIKE_ALERT_EMAIL` | `alert_email` | `you@example.com` |
+| `BIKE_MODE` | `mode` | `both` — `bike`, `row`, or `both` |
+| `BIKE_USGS_SITE` | `usgs_site` | `01646500` (Potomac at DC; rowing) |
+| `BIKE_WATER_TEMP_C` | `water_temp_c` | `12` (manual fallback if the gauge has no temp) |
 
 Parsing notes: booleans accept `1/true/yes/on`; lists are comma-separated (or a
 JSON array), and `none` clears them. Anything you don't set keeps the default
@@ -183,15 +186,27 @@ as tabs in the HTML version and as separate pages (one day per page) in the PDF:
 1. **Recommended ride window** — the single best block, light-aware.
 2. **Bikeability heatmap** — every model vs the consensus, hour by hour, with
    the best window starred.
-3. **What the models say** — plain-language highlights.
-4. **Consensus table** — every three hours (rich HTML on the web, a colour-coded
+3. **Why some hours rate low** — *only when a model rates any hour Poor or
+   worse*: the hours, how many models agree, and the dominant reason (storms,
+   heat, rain, cold, or wind), read straight from the score's own penalties.
+4. **What the models say** — plain-language highlights.
+5. **Consensus table** — every three hours (rich HTML on the web, a colour-coded
    image in the PDF).
-5. **Heat stress (WBGT)** — *only when heat is a concern*: the flag reached,
+6. **Heat stress (WBGT)** — *only when heat is a concern*: the flag reached,
    flag windows, wet-bulb danger, and ride advice, plus a focused WBGT chart.
-6. **Wind chill** — *only when cold is a concern*: the feels-like low, the
+7. **Wind chill** — *only when cold is a concern*: the feels-like low, the
    frostbite-risk band, and cold-weather advice, plus a focused chart.
-7. **Temperature, heat stress & UV** and **Precipitation, storms & wind** — the
+8. **Temperature, heat stress & UV** and **Precipitation, storms & wind** — the
    detailed multi-panel charts.
+
+With `mode` set to `row` or `both`, each day also gets a **Rowing** view
+(singles / small-boat oriented): a rowing conditions heatmap (every model vs the
+consensus, scored for wind and chop, gusts, fog/visibility, and cold-water
+immersion risk) and its own "why some rowing hours rate low" callout. A single
+**River conditions now** callout above the days reports live USGS gauge flow,
+stage, trend, and water temperature (this is current, not a forecast). In `both`
+mode each day's tab holds a nested pair of tabs — **Cycling** (first) and
+**Rowing** — in the HTML build; the PDF renders them as sequential subsections.
 
 A methodology section closes it out.
 
@@ -212,6 +227,18 @@ Scores map to ratings: **Avoid · Poor · Fair · Good · Excellent**. Full
 thresholds are documented in the report's methodology section and in the
 `CONFIG` block of the script.
 
+### Rowing score (singles / small boats)
+
+Same 0–100 scale, but tuned for on-water sculling. An hour loses points for
+**wind and chop** (sustained wind ≥ ~12 mph raises whitecaps, with heavier
+penalties above the moderate/high cutoffs), **gusts** that can catch a blade,
+**fog / low visibility** (from the visibility field, or a dew-point-depression
+proxy when it's missing), and **cold-water immersion risk** using the club-style
+air+water rule — below ~100 °F combined, dress for immersion; below ~90 °F (or
+water under 50 °F) singles are unsafe. Thunder or strong instability caps the
+hour at "Avoid." The live river flow bands are **advisory** — set `ROW_*` and
+`FLOW_*` in the `CONFIG` block to your club's actual rules.
+
 ---
 
 ## Data sources
@@ -220,6 +247,8 @@ thresholds are documented in the report's methodology section and in the
   through one API.
 - **Alerts:** US [National Weather Service](https://www.weather.gov)
   (`api.weather.gov`).
+- **River conditions (rowing):** [USGS Water Services](https://waterservices.usgs.gov)
+  instantaneous values — discharge, gage height, and water temperature.
 
 Derived comfort metrics use published methods: NWS Rothfusz heat index, Stull
 (2011) wet-bulb, the standard outdoor WBGT weighting, the NWS wind-chill

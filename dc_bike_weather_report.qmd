@@ -101,6 +101,11 @@ alert_email = _env("BIKE_ALERT_EMAIL", "replace-with-your-email@example.com")
 _ph = _envlist("BIKE_PREFERRED_HOURS", [5, 9])    # "5,9" or "none"; [start, end) no-dark window
 preferred_hours = [int(x) for x in _ph] if _ph else None
 models = _envlist("BIKE_MODELS", None)            # "gfs_seamless,ecmwf_ifs025"; none/"" = all
+
+mode = _env("BIKE_MODE", "both")                  # "bike", "row", or "both"
+usgs_site = _env("BIKE_USGS_SITE", "01646500")    # USGS gauge for river conditions (rowing)
+_wt = _env("BIKE_WATER_TEMP_C", "")               # manual water temp °C, if the gauge lacks it
+water_temp_c = float(_wt) if _wt else None
 ```
 
 ```{python}
@@ -118,6 +123,7 @@ bw.configure(
     forecast_days=forecast_days, units=units, have_light=have_light,
     preferred_hours=preferred_hours, ride_hours=ride_hours, models=models,
     show_alerts=show_alerts, alert_email=alert_email,
+    mode=mode, usgs_site=usgs_site, water_temp_c=water_temp_c,
 )
 
 FIGDIR = "report_figs"
@@ -127,8 +133,17 @@ os.makedirs(FIGDIR, exist_ok=True)
 js = bw.fetch()
 panel = bw.to_panel(js)
 alerts = bw.fetch_alerts() if show_alerts else []
-days = bw.split_by_day(panel)
 n_models = len(panel)
+
+# Which views to render, and the live river conditions for the rowing view.
+bike_on = mode in ("bike", "both")
+row_on = mode in ("row", "both")
+river = bw.fetch_river(usgs_site) if row_on else None
+if row_on:
+    bw.add_row_scores(panel, (river or {}).get("water_c"))
+
+# Split into per-day frames AFTER rowing scores are attached, so each day carries them.
+days = bw.split_by_day(panel)
 
 
 def table_html(idx, agg):
@@ -190,6 +205,20 @@ if alerts:
 ```
 
 ```{python}
+#| label: river
+#| output: asis
+# Live USGS river conditions (rowing only) — shown once; this is current, not a forecast.
+if row_on:
+    rn = bw.river_notes(river)
+    if rn:
+        kind, title, lines = rn
+        print(f"::: {{.callout-{kind} title='{title}'}}")
+        for ln in lines:
+            print(f"- {ln}")
+        print(":::\n")
+```
+
+```{python}
 #| label: days
 #| output: asis
 # Each day is a tab in the HTML build. In PDF a tabset has no meaning, so Quarto
@@ -208,72 +237,102 @@ for di_, (d, sub) in enumerate(days):
         print(":::\n")
     print(f"\n## {label}\n")
 
-    # Headline recommendation (first bullet, minus the leading star).
-    print("::: {.callout-tip title='Recommended ride window'}")
-    print(bullets[0].replace("\u2605 ", "") + "\n")
-    print(":::\n")
-
-    # At-a-glance suitability grid.
-    p = save(bw.fig_heatmap(sub, didx, agg, sun, win), f"heat_{di_}.png")
-    print(f"![Hourly bikeability \u2014 each model vs the consensus]({p}){{width=100%}}\n")
-
-    # Narrative.
-    print("**What the models say**\n")
-    for b in bullets[1:]:
-        print(f"- {b}")
-    print()
-
-    # Consensus table: rich HTML for the web build, colour-coded image for PDF.
-    print("**Consensus every 3 hours**\n")
-    print('::: {.content-visible when-format="html"}')
-    print(table_html(didx, agg))
-    print(":::\n")
-    tp = save(bw.fig_table(didx, agg), f"table_{di_}.png")
-    print('::: {.content-visible when-format="pdf"}')
-    print(f"![]({tp}){{width=85%}}")
-    print(":::\n")
-
-    # Heat-stress (WBGT) view — shown only when heat is a concern.
-    hf = bw.heat_flags(didx, agg)
-    if hf["concern"]:
-        flag = hf["peak_flag"]
-        kind = "important" if flag in ("Red", "Black") else "warning"
-        wins = hf["windows"]
-        span = (f"; in the {flag} zone {wins[flag]}"
-                if wins.get(flag) else "")
-        print(f"::: {{.callout-{kind} title='Heat stress \u2014 {flag} flag'}}")
-        print(f"Peak WBGT **{bw.Td(hf['peak_wbgt_c']):.0f}{bw.TU}** ({flag}) "
-              f"around {bw.hm(hf['peak_hour'])}{span}.\n")
-        if hf["wetbulb_danger"]:
-            print(f"- **Wet-bulb reaches {bw.Td(hf['wetbulb_max_c']):.0f}{bw.TU}** "
-                  f"\u2014 sweat can barely cool you; treat any hard effort as dangerous.")
-        for r in hf["recommendations"]:
-            print(f"- {r}")
+    both_views = bike_on and row_on
+    if both_views:                    # nested tabset: Cycling / Rowing tabs in HTML
+        print("::: {.panel-tabset}\n")
+        print("### Cycling\n")
+    if bike_on:
+        # Headline recommendation (first bullet, minus the leading star).
+        print("::: {.callout-tip title='Recommended ride window'}")
+        print(bullets[0].replace("\u2605 ", "") + "\n")
         print(":::\n")
-        pw = save(bw.fig_wbgt(sub, didx, agg, label, sun), f"wbgt_{di_}.png")
-        print(f"![Heat stress (WBGT) against athletic flags]({pw}){{width=100%}}\n")
 
-    # Wind-chill view — shown only when cold is a concern.
-    cf = bw.cold_flags(didx, agg)
-    if cf["concern"]:
-        band = cf["band"]
-        kind = ("important" if band in ("Very cold", "Dangerous")
-                else "warning" if band == "Cold" else "note")
-        print(f"::: {{.callout-{kind} title='Wind chill \u2014 {band}'}}")
-        print(f"Feels-like low **{bw.Td(cf['min_wc_c']):.0f}{bw.TU}** ({band}) "
-              f"around {bw.hm(cf['min_hour'])}; wind makes it up to "
-              f"{bw.dTd(cf['max_gap_c']):.0f}{bw.TU} colder than the air.\n")
-        for r in cf["recommendations"]:
-            print(f"- {r}")
+        # At-a-glance suitability grid.
+        p = save(bw.fig_heatmap(sub, didx, agg, sun, win), f"heat_{di_}.png")
+        print(f"![Hourly bikeability \u2014 each model vs the consensus]({p}){{width=100%}}\n")
+
+        # Explain any hours a model rates Poor or worse, and whether models agree.
+        notes = bw.low_rating_notes(sub, didx)
+        if notes:
+            print("::: {.callout-note title='Why some hours rate low'}")
+            for n in notes:
+                print(f"- {n}")
+            print(":::\n")
+
+        # Narrative.
+        print("**What the models say**\n")
+        for b in bullets[1:]:
+            print(f"- {b}")
+        print()
+
+        # Consensus table: rich HTML for the web build, colour-coded image for PDF.
+        print("**Consensus every 3 hours**\n")
+        print('::: {.content-visible when-format="html"}')
+        print(table_html(didx, agg))
         print(":::\n")
-        pwc = save(bw.fig_windchill(sub, didx, agg, label, sun), f"wchill_{di_}.png")
-        print(f"![Wind chill (feels-like) against frostbite risk]({pwc}){{width=100%}}\n")
+        tp = save(bw.fig_table(didx, agg), f"table_{di_}.png")
+        print('::: {.content-visible when-format="pdf"}')
+        print(f"![]({tp}){{width=85%}}")
+        print(":::\n")
 
-    # Detailed charts.
-    pt = save(bw.fig_thermal(sub, didx, agg, label, sun), f"therm_{di_}.png")
-    print(f"![Temperature, heat stress and UV]({pt}){{width=100%}}\n")
-    pc = save(bw.fig_conditions(sub, didx, agg, label, sun), f"cond_{di_}.png")
-    print(f"![Precipitation, storms and wind]({pc}){{width=100%}}\n")
+        # Heat-stress (WBGT) view — shown only when heat is a concern.
+        hf = bw.heat_flags(didx, agg)
+        if hf["concern"]:
+            flag = hf["peak_flag"]
+            kind = "important" if flag in ("Red", "Black") else "warning"
+            wins = hf["windows"]
+            span = (f"; in the {flag} zone {wins[flag]}"
+                    if wins.get(flag) else "")
+            print(f"::: {{.callout-{kind} title='Heat stress \u2014 {flag} flag'}}")
+            print(f"Peak WBGT **{bw.Td(hf['peak_wbgt_c']):.0f}{bw.TU}** ({flag}) "
+                  f"around {bw.hm(hf['peak_hour'])}{span}.\n")
+            if hf["wetbulb_danger"]:
+                print(f"- **Wet-bulb reaches {bw.Td(hf['wetbulb_max_c']):.0f}{bw.TU}** "
+                      f"\u2014 sweat can barely cool you; treat any hard effort as dangerous.")
+            for r in hf["recommendations"]:
+                print(f"- {r}")
+            print(":::\n")
+            pw = save(bw.fig_wbgt(sub, didx, agg, label, sun), f"wbgt_{di_}.png")
+            print(f"![Heat stress (WBGT) against athletic flags]({pw}){{width=100%}}\n")
+
+        # Wind-chill view — shown only when cold is a concern.
+        cf = bw.cold_flags(didx, agg)
+        if cf["concern"]:
+            band = cf["band"]
+            kind = ("important" if band in ("Very cold", "Dangerous")
+                    else "warning" if band == "Cold" else "note")
+            print(f"::: {{.callout-{kind} title='Wind chill \u2014 {band}'}}")
+            print(f"Feels-like low **{bw.Td(cf['min_wc_c']):.0f}{bw.TU}** ({band}) "
+                  f"around {bw.hm(cf['min_hour'])}; wind makes it up to "
+                  f"{bw.dTd(cf['max_gap_c']):.0f}{bw.TU} colder than the air.\n")
+            for r in cf["recommendations"]:
+                print(f"- {r}")
+            print(":::\n")
+            pwc = save(bw.fig_windchill(sub, didx, agg, label, sun), f"wchill_{di_}.png")
+            print(f"![Wind chill (feels-like) against frostbite risk]({pwc}){{width=100%}}\n")
+
+        # Detailed charts.
+        pt = save(bw.fig_thermal(sub, didx, agg, label, sun), f"therm_{di_}.png")
+        print(f"![Temperature, heat stress and UV]({pt}){{width=100%}}\n")
+        pc = save(bw.fig_conditions(sub, didx, agg, label, sun), f"cond_{di_}.png")
+        print(f"![Precipitation, storms and wind]({pc}){{width=100%}}\n")
+
+    if row_on:
+        if both_views:
+            print("### Rowing\n")
+        rp = save(bw.fig_heatmap(sub, didx, agg, sun, None, score_col="row_score",
+                                 title="Hourly rowing conditions \u2014 each model vs the consensus"),
+                  f"row_{di_}.png")
+        print(f"![Hourly rowing conditions \u2014 each model vs the consensus]({rp}){{width=100%}}\n")
+        rnotes = bw.row_low_rating_notes(sub, didx, (river or {}).get("water_c"))
+        if rnotes:
+            print("::: {.callout-note title='Why some rowing hours rate low'}")
+            for n in rnotes:
+                print(f"- {n}")
+            print(":::\n")
+
+    if both_views:
+        print(":::\n")                # close the nested Cycling/Rowing tabset
 
 print(":::\n")                        # close the day tabset
 ```
@@ -284,5 +343,7 @@ print(":::\n")                        # close the day tabset
 #| label: method
 #| output: asis
 print(bw.methodology_text() + "\n")
+if row_on:
+    print("\n" + bw.row_methodology_text() + "\n")
 print("\n*" + bw.methodology_src() + "*")
 ```

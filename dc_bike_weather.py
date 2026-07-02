@@ -106,13 +106,27 @@ WETBULB_DANGER = 28.0                                   # degC, exertion danger
 RAIN_MM_LIGHT, RAIN_MM_MOD, RAIN_MM_HEAVY = 0.1, 0.5, 2.5
 CAPE_MARGINAL, CAPE_MOD, CAPE_STRONG, CAPE_EXTREME = 500, 1000, 2500, 4000
 GUST_HIGH_MPH, GUST_MOD_MPH, WIND_HIGH_MPH = 40, 30, 25
+
+# --- Rowing mode (singles / small-boat oriented; wind compared in mph) --------
+MODE = "bike"                                      # "bike", "row", or "both"
+ROW_WIND_MOD_MPH, ROW_WIND_HIGH_MPH = 10, 15       # sustained: chop / singles risk
+ROW_GUST_MOD_MPH, ROW_GUST_HIGH_MPH = 17, 23       # gusts that upset a single
+ROW_WHITECAP_MPH = 12                              # sustained wind that raises whitecaps
+ROW_VIS_LOW_M, ROW_VIS_MOD_M = 1000, 3000          # metres; fog / collision risk
+ROW_COLDWATER_SUM_F = 100                          # air+water below -> dress for immersion
+ROW_COLDWATER_DANGER_F = 90                        # air+water below -> singles unsafe
+ROW_WATER_COLD_C = 10.0                            # water below ~50 degF -> cold-shock risk
+# Live river gauge (USGS NWIS instantaneous values). Default: Potomac at DC.
+USGS_SITE = "01646500"                             # Potomac River near Washington, DC
+FLOW_ELEVATED_CFS, FLOW_HIGH_CFS = 10000, 20000    # advisory only -> set to club rules
+WATER_TEMP_C = None                                # manual fallback if gauge lacks temp
 # ============================================================================
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
 CORE_VARS = ["temperature_2m", "relative_humidity_2m", "precipitation",
              "precipitation_probability", "weather_code", "cloud_cover",
              "wind_speed_10m", "wind_gusts_10m", "wind_direction_10m",
-             "shortwave_radiation", "uv_index"]
+             "shortwave_radiation", "uv_index", "visibility"]
 BASE_VARS = CORE_VARS + ["cape"]
 
 # UV index categories (WHO): upper bound, label, color.
@@ -162,6 +176,10 @@ def configure(**kw):
         "alert_ua": "ALERT_UA", "nws_alerts_url": "NWS_ALERTS_URL",
         "wetbulb_danger": "WETBULB_DANGER", "gust_high_mph": "GUST_HIGH_MPH",
         "gust_mod_mph": "GUST_MOD_MPH", "wind_high_mph": "WIND_HIGH_MPH",
+        "mode": "MODE", "usgs_site": "USGS_SITE", "water_temp_c": "WATER_TEMP_C",
+        "flow_elevated_cfs": "FLOW_ELEVATED_CFS", "flow_high_cfs": "FLOW_HIGH_CFS",
+        "row_wind_mod_mph": "ROW_WIND_MOD_MPH", "row_wind_high_mph": "ROW_WIND_HIGH_MPH",
+        "row_gust_mod_mph": "ROW_GUST_MOD_MPH", "row_gust_high_mph": "ROW_GUST_HIGH_MPH",
     }
     for k, name in simple.items():
         if kw.get(k) is not None:
@@ -180,7 +198,8 @@ def configure(**kw):
     g["TU"] = "\u00b0F" if g["US"] else "\u00b0C"
     g["WU"] = "mph" if g["US"] else "km/h"
     return {"place": g["PLACE"], "units": g["UNITS"],
-            "forecast_days": g["FORECAST_DAYS"], "models": list(g["MODELS"])}
+            "forecast_days": g["FORECAST_DAYS"], "models": list(g["MODELS"]),
+            "mode": g["MODE"]}
 
 
 # ---------------------------- unit helpers ----------------------------------
@@ -307,13 +326,19 @@ def severe_level(cape, wcode, gust_ms):
     lvl = np.where(g > GUST_HIGH_MPH, np.maximum(lvl, 2), lvl)
     return lvl
 
-def suitability(df):
-    """Composite 0-100 bikeability score for one model's hourly frame."""
-    t_f = df["t_c"].values * 9 / 5 + 32
+def penalty_components(df):
+    """Per-hour penalty pieces behind the bikeability score, plus the raw drivers.
+
+    suitability() is defined in terms of this, so any explanation built from these
+    components describes exactly the penalties that produced the score."""
+    t_c = df["t_c"].values
+    t_f = t_c * 9 / 5 + 32
     wbgt, tw = df["wbgt_c"].values, df["tw_c"].values
-    hi_f = df["hi_c"].values * 9 / 5 + 32
+    hi_c = df["hi_c"].values
+    hi_f = hi_c * 9 / 5 + 32
     precip = df["precip"].fillna(0).values
-    gmph, wmph = df["gust_ms"].values * 2.23694, df["wind_ms"].values * 2.23694
+    gms, wms = df["gust_ms"].values, df["wind_ms"].values
+    gmph, wmph = gms * 2.23694, wms * 2.23694
     sev, thunder = df["severe"].values, df["thunder"].values
 
     # Heat penalty: prefer WBGT (needs sun + humidity); fall back to heat index
@@ -334,13 +359,298 @@ def suitability(df):
     sevp = np.select([sev >= 4, sev >= 3, sev >= 2, sev >= 1], [80, 55, 30, 10], 0)
     wind = (np.where(gmph > GUST_HIGH_MPH, 25, np.where(gmph > GUST_MOD_MPH, 12, 0))
             + np.where(wmph > WIND_HIGH_MPH, 10, 0))
-    score = np.clip(100 - (heat + cold + rain + sevp + wind), 0, 100)
-    cap = np.where(thunder | (sev >= 3), 25, 100)           # storms -> Avoid
+    return {
+        "heat": heat, "cold": cold, "rain": rain, "severe": sevp, "wind": wind,
+        "capped": (np.asarray(thunder, bool) | (sev >= 3)),        # storms -> Avoid
+        "wbgt_c": wbgt, "tw_c": tw, "hi_c": hi_c, "t_c": t_c,
+        "precip": precip, "gust_ms": gms, "wind_ms": wms,
+        "sev": sev, "thunder": np.asarray(thunder, bool),
+    }
+
+def suitability(df):
+    """Composite 0-100 bikeability score for one model's hourly frame."""
+    c = penalty_components(df)
+    score = np.clip(100 - (c["heat"] + c["cold"] + c["rain"]
+                           + c["severe"] + c["wind"]), 0, 100)
+    cap = np.where(c["capped"], 25, 100)                    # storms -> Avoid
     return np.minimum(score, cap)
 
 def wbgt_flag(w):
     return ("Black" if w >= WBGT_BLACK else "Red" if w >= WBGT_RED
             else "Yellow" if w >= WBGT_YELLOW else "Green")
+
+
+def _reason_phrases(c, i):
+    """Ranked [(penalty, text, category), ...] for what dragged hour i's score
+    down, biggest penalty first. Text uses display units to match the charts."""
+    out = []
+    # Storms / instability: this is what caps an hour at Avoid.
+    if bool(c["thunder"][i]):
+        out.append((100.0, "thunderstorms in the forecast", "storm"))
+    elif c["severe"][i] > 0:
+        names = {4: "extreme instability (very high CAPE)",
+                 3: "strong instability (high CAPE)",
+                 2: "moderate instability", 1: "marginal instability"}
+        out.append((float(c["severe"][i]),
+                    names.get(int(c["sev"][i]), "instability"), "storm"))
+    # Heat: name whichever metric actually drove the penalty.
+    if c["heat"][i] > 0:
+        w, tw = c["wbgt_c"][i], c["tw_c"][i]
+        if w == w and w >= WBGT_YELLOW:                      # w==w screens NaN
+            txt = (f"heat stress \u2014 WBGT in the {wbgt_flag(w)} zone "
+                   f"({Td(w):.0f}{TU})")
+        elif tw == tw and tw >= WETBULB_DANGER:
+            txt = f"dangerous humidity (wet-bulb {Td(tw):.0f}{TU})"
+        elif c["hi_c"][i] == c["hi_c"][i]:
+            txt = f"heat index {Td(c['hi_c'][i]):.0f}{TU}"
+        else:
+            txt = f"high temperature ({Td(c['t_c'][i]):.0f}{TU})"
+        out.append((float(c["heat"][i]), txt, "heat"))
+    # Cold.
+    if c["cold"][i] > 0:
+        word = ("hard freeze" if c["cold"][i] >= 40
+                else "freezing cold" if c["cold"][i] >= 20 else "cold")
+        out.append((float(c["cold"][i]), f"{word} ({Td(c['t_c'][i]):.0f}{TU})", "cold"))
+    # Rain (qualitative, so it reads the same in either unit system).
+    if c["rain"][i] > 0:
+        word = ("heavy rain" if c["rain"][i] >= 45
+                else "moderate rain" if c["rain"][i] >= 25 else "light rain")
+        out.append((float(c["rain"][i]), word, "rain"))
+    # Wind: gusts and/or sustained.
+    if c["wind"][i] > 0:
+        parts = []
+        if c["gust_ms"][i] * 2.23694 > GUST_HIGH_MPH:
+            parts.append(f"strong gusts ({Wd(c['gust_ms'][i]):.0f}{WU})")
+        elif c["gust_ms"][i] * 2.23694 > GUST_MOD_MPH:
+            parts.append(f"gusty wind ({Wd(c['gust_ms'][i]):.0f}{WU})")
+        if c["wind_ms"][i] * 2.23694 > WIND_HIGH_MPH:
+            parts.append("strong sustained wind")
+        out.append((float(c["wind"][i]), " and ".join(parts) if parts else "wind", "wind"))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def _low_rating_notes(panel, idx, score_col, comp_fn, phrase_fn):
+    """Generic 'why is it rated low' builder shared by cycling and rowing.
+
+    Returns short markdown strings, each covering a contiguous block of hours,
+    saying how many models rate it Poor-or-worse and the dominant reason(s). The
+    worst-scoring model at each hour supplies the reason (it sets the lowest
+    rating shown on the heatmap)."""
+    models = list(panel)
+    if not models:
+        return []
+    N = len(models)
+    comps = {m: comp_fn(panel[m]) for m in models}
+    scores = np.array([panel[m][score_col].values for m in models])   # (N, H)
+    cats = np.digitize(scores, RATING_BINS)                           # 0..4
+    H = scores.shape[1]
+
+    per_hour = []
+    for i in range(H):
+        bad = cats[:, i] <= 1                          # Poor (1) or Avoid (0)
+        if not bad.any():
+            per_hour.append(None); continue
+        wm = int(np.argmin(scores[:, i]))              # worst model drives it
+        ph = phrase_fn(comps[models[wm]], i)
+        pen, txt, cat = ph[0] if ph else (0.0, "poor conditions", "other")
+        per_hour.append({"i": i, "n_bad": int(bad.sum()),
+                         "worst": RATING_LABELS[int(cats[:, i].min())],
+                         "pen": pen, "text": txt, "cat": cat,
+                         "sec": [(t, cc) for _, t, cc in ph[1:]]})
+
+    # Merge consecutive hours sharing scope (all vs some), rating and reason kind.
+    groups = []
+    for h in per_hour:
+        if h is None:
+            continue
+        scope = "all" if h["n_bad"] == N else "some"
+        key = (scope, h["worst"], h["cat"])
+        if groups and groups[-1]["key"] == key and h["i"] == groups[-1]["j"] + 1:
+            g = groups[-1]; g["j"] = h["i"]
+            if h["pen"] > g["pen"]:                    # keep the worst hour's text
+                g["pen"], g["text"] = h["pen"], h["text"]
+            for t, cc in h["sec"]:
+                g["sec"].setdefault(cc, t)
+        else:
+            sec = {}
+            for t, cc in h["sec"]:
+                sec.setdefault(cc, t)
+            groups.append({"key": key, "i": h["i"], "j": h["i"], "scope": scope,
+                           "worst": h["worst"], "pen": h["pen"],
+                           "text": h["text"], "cat": h["cat"], "sec": sec})
+
+    notes = []
+    for g in groups:
+        mask = np.zeros(len(idx), bool); mask[g["i"]:g["j"] + 1] = True
+        win = window_text(idx, mask)
+        who = f"all {N} models" if g["scope"] == "all" else "some models"
+        reasons = g["text"]
+        extras = [t for cc, t in g["sec"].items() if cc != g["cat"]]
+        if extras:
+            reasons += "; also " + ", ".join(extras)
+        notes.append(f"**{win} \u2014 {g['worst']}** ({who}): {reasons}.")
+    return notes
+
+
+def low_rating_notes(panel, idx):
+    """Explain every hour any model rates cycling Poor or worse."""
+    return _low_rating_notes(panel, idx, "score", penalty_components, _reason_phrases)
+
+
+# =========================== rowing (singles) ================================
+
+def _fog_risk(df):
+    """(visibility_m array, low_bool, moderate_bool) per hour. Uses the visibility
+    field when present, else a dewpoint-depression proxy from temp + humidity."""
+    n = len(df)
+    vis = df["vis"].values.astype(float) if "vis" in df else np.full(n, np.nan)
+    have = ~np.isnan(vis)
+    low = have & (vis < ROW_VIS_LOW_M)
+    mod = have & (vis >= ROW_VIS_LOW_M) & (vis < ROW_VIS_MOD_M)
+    if not have.all():                                 # dewpoint fallback
+        t = df["t_c"].values
+        rh = np.clip(df["rh"].values.astype(float), 1, 100)
+        a, b = 17.625, 243.04
+        gamma = np.log(rh / 100.0) + a * t / (b + t)
+        dew = b * gamma / (a - gamma)
+        dep = t - dew                                  # small spread -> fog likely
+        low = low | ((~have) & (dep < 2.0))
+        mod = mod | ((~have) & (dep >= 2.0) & (dep < 3.5))
+    return vis, low, mod
+
+
+def row_penalty_components(df, water_c=None):
+    """Per-hour penalties behind the rowing score, plus raw drivers. Singles/small
+    boats: wind and chop, gusts, fog/visibility, and cold-water immersion risk
+    (per-hour air temp combined with the current water temperature)."""
+    t_c = df["t_c"].values
+    t_f = t_c * 9 / 5 + 32
+    wms, gms = df["wind_ms"].values, df["gust_ms"].values
+    wmph, gmph = wms * 2.23694, gms * 2.23694
+    sev = df["severe"].values
+    thunder = np.asarray(df["thunder"].values, bool)
+    vis, fog_low, fog_mod = _fog_risk(df)
+
+    wind = np.select([wmph >= ROW_WIND_HIGH_MPH, wmph >= ROW_WIND_MOD_MPH,
+                      wmph >= ROW_WHITECAP_MPH], [55, 30, 18], 0)
+    gust = np.where(gmph >= ROW_GUST_HIGH_MPH, 35,
+                    np.where(gmph >= ROW_GUST_MOD_MPH, 18, 0))
+    fog = np.where(fog_low, 60, np.where(fog_mod, 25, 0))
+    if water_c is None or water_c != water_c:
+        cold = np.zeros(len(df)); summ = np.full(len(df), np.nan)
+    else:
+        summ = t_f + (water_c * 9 / 5 + 32)
+        cold = np.select([summ < ROW_COLDWATER_DANGER_F, water_c < ROW_WATER_COLD_C,
+                          summ < ROW_COLDWATER_SUM_F], [70, 55, 30], 0)
+    return {"wind": wind, "gust": gust, "fog": fog, "cold": cold,
+            "capped": (thunder | (sev >= 3)),
+            "wind_ms": wms, "gust_ms": gms, "wmph": wmph, "gmph": gmph,
+            "vis": vis, "fog_low": fog_low, "fog_mod": fog_mod,
+            "t_c": t_c, "water_c": (np.nan if water_c is None else water_c),
+            "sum_f": summ, "sev": sev, "thunder": thunder}
+
+
+def row_suitability(df, water_c=None):
+    """Composite 0-100 rowing score for one model's hourly frame."""
+    c = row_penalty_components(df, water_c)
+    score = np.clip(100 - (c["wind"] + c["gust"] + c["fog"] + c["cold"]), 0, 100)
+    cap = np.where(c["capped"], 25, 100)                    # storms -> Avoid
+    return np.minimum(score, cap)
+
+
+def add_row_scores(panel, water_c=None):
+    """Attach a 'row_score' column to each model frame (needs current water temp
+    for the cold-water rule; pass None to skip that term)."""
+    for m in panel:
+        panel[m]["row_score"] = row_suitability(panel[m], water_c)
+    return panel
+
+
+def _row_reason_phrases(c, i):
+    """Ranked [(penalty, text, category), ...] for what makes rowing hour i low."""
+    out = []
+    if bool(c["thunder"][i]):
+        out.append((100.0, "thunderstorms \u2014 get off the water", "storm"))
+    elif c["sev"][i] > 0:
+        names = {4: "extreme instability", 3: "strong instability",
+                 2: "moderate instability", 1: "marginal instability"}
+        out.append((float(80 if c["sev"][i] >= 4 else 55),
+                    names.get(int(c["sev"][i]), "instability"), "storm"))
+    if c["cold"][i] > 0:
+        w = c["water_c"]
+        txt = "cold water" + (f" ({Td(w):.0f}{TU})" if w == w else "")
+        out.append((float(c["cold"][i]), txt + " \u2014 immersion risk", "cold"))
+    if c["fog"][i] > 0:
+        if c["fog_low"][i]:
+            v = c["vis"][i]
+            txt = "fog / low visibility" + (f" ({v / 1000:.1f} km)" if v == v else "")
+        else:
+            txt = "reduced visibility"
+        out.append((float(c["fog"][i]), txt, "fog"))
+    if c["wind"][i] > 0 or c["gust"][i] > 0:
+        bits = []
+        if c["wmph"][i] >= ROW_WHITECAP_MPH:
+            bits.append(f"whitecaps likely (wind {Wd(c['wind_ms'][i]):.0f}{WU})")
+        elif c["wind"][i] > 0:
+            bits.append(f"choppy (wind {Wd(c['wind_ms'][i]):.0f}{WU})")
+        if c["gmph"][i] >= ROW_GUST_MOD_MPH:
+            bits.append(f"gusts {Wd(c['gust_ms'][i]):.0f}{WU}")
+        out.append((float(max(c["wind"][i], c["gust"][i])),
+                    " and ".join(bits) if bits else "wind", "wind"))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def row_low_rating_notes(panel, idx, water_c=None):
+    """Explain every hour any model rates rowing Poor or worse."""
+    return _low_rating_notes(panel, idx, "row_score",
+                             lambda df: row_penalty_components(df, water_c),
+                             _row_reason_phrases)
+
+
+def river_notes(river):
+    """(callout_kind, headline, [lines]) summarising live USGS river conditions,
+    or None when nothing was returned. Flow/stage/water temperature are 'now',
+    not a forecast."""
+    if not river or (river.get("flow_cfs") is None and river.get("water_c") is None):
+        return None
+    kind, lines = "note", []
+    flow, stage, w = river.get("flow_cfs"), river.get("stage_ft"), river.get("water_c")
+    if flow is not None:
+        trend = f", {river['flow_trend']}" if river.get("flow_trend") else ""
+        lvl = ("high" if flow >= FLOW_HIGH_CFS else
+               "elevated" if flow >= FLOW_ELEVATED_CFS else "normal")
+        extra = f"; stage {stage:.1f} ft" if stage is not None else ""
+        lines.append(f"Flow **{flow:,.0f} cfs** ({lvl}{trend}){extra}.")
+        if flow >= FLOW_HIGH_CFS:
+            kind = "important"
+            lines.append("High water \u2014 fast current and debris; singles not advised.")
+        elif flow >= FLOW_ELEVATED_CFS:
+            kind = "warning"
+            lines.append("Elevated flow \u2014 stronger current than usual; stay near shore.")
+    if w is not None:
+        lines.append(f"Water temperature **{Td(w):.0f}{TU}**.")
+        if w < ROW_WATER_COLD_C:
+            kind = "important"
+            lines.append(f"Cold water (<{Td(ROW_WATER_COLD_C):.0f}{TU}) \u2014 dress for "
+                         "immersion; a buddy or launch is strongly advised.")
+    return kind, "River conditions now", lines
+
+
+def row_methodology_text():
+    return (
+        "Rowing view (singles / small boats). Score starts at 100 and subtracts "
+        "penalties for wind and chop (sustained \u2265" f"{ROW_WHITECAP_MPH} mph raises "
+        f"whitecaps; heavier above {ROW_WIND_MOD_MPH}/{ROW_WIND_HIGH_MPH} mph), gusts "
+        f"(\u2265{ROW_GUST_MOD_MPH}/{ROW_GUST_HIGH_MPH} mph), fog / low visibility, and "
+        "cold-water immersion risk. Cold water uses the club-style air+water rule: "
+        f"below {ROW_COLDWATER_SUM_F}\u00b0F combined dress for immersion, below "
+        f"{ROW_COLDWATER_DANGER_F}\u00b0F (or water under {Td(ROW_WATER_COLD_C):.0f}{TU}) "
+        "singles are unsafe. Any thunder or strong instability caps the hour at Avoid. "
+        "Flow, stage and water temperature are live from the USGS gauge and reflect "
+        "current conditions, not a forecast; the flow bands are advisory \u2014 set them "
+        "to your club's rules.")
 
 
 def wind_chill_c(t_c, w_kmh):
@@ -514,6 +824,53 @@ def fetch_alerts():
         print(f"[note] NWS alerts unavailable ({e})")
         return []
 
+USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
+
+def fetch_river(site=None):
+    """Latest USGS gauge readings for river conditions: discharge (cfs), gage
+    height (ft) and water temperature (degC). Returns a dict; any field may be
+    None if the gauge does not report it. Never raises (mirrors fetch_alerts)."""
+    site = site or USGS_SITE
+    out = {"site": site, "name": None, "flow_cfs": None, "stage_ft": None,
+           "water_c": None, "flow_trend": None, "time": None}
+    try:
+        r = requests.get(USGS_IV_URL, params={
+            "format": "json", "sites": site, "period": "P1D",
+            "parameterCd": "00060,00065,00010", "siteStatus": "all"},
+            headers={"User-Agent": ALERT_UA}, timeout=30)
+        r.raise_for_status()
+        series = r.json()["value"]["timeSeries"]
+    except Exception as e:
+        print(f"[note] USGS river data unavailable ({e})")
+        if WATER_TEMP_C is not None:
+            out["water_c"] = float(WATER_TEMP_C)
+        return out
+    by_code = {}
+    for ts in series:
+        try:
+            code = ts["variable"]["variableCode"][0]["value"]
+            pts = ts["values"][0]["value"]
+            vals = [(p["dateTime"], float(p["value"])) for p in pts
+                    if p.get("value") not in (None, "", "-999999", "-999999.0")]
+            if vals:
+                by_code[code] = vals
+                out["name"] = ts["sourceInfo"]["siteName"]
+        except Exception:
+            continue
+    if "00060" in by_code:
+        s = by_code["00060"]; out["flow_cfs"], out["time"] = s[-1][1], s[-1][0]
+        if len(s) >= 2:
+            out["flow_trend"] = ("rising" if s[-1][1] > s[-2][1] * 1.02
+                                 else "falling" if s[-1][1] < s[-2][1] * 0.98
+                                 else "steady")
+    if "00065" in by_code:
+        out["stage_ft"] = by_code["00065"][-1][1]
+    if "00010" in by_code:
+        out["water_c"] = by_code["00010"][-1][1]
+    elif WATER_TEMP_C is not None:
+        out["water_c"] = float(WATER_TEMP_C)
+    return out
+
 def to_panel(js):
     """dict[model_id] -> enriched hourly DataFrame (models with no data dropped)."""
     h = js["hourly"]
@@ -523,7 +880,8 @@ def to_panel(js):
               "weather_code": "wcode", "cloud_cover": "cloud",
               "wind_speed_10m": "wind_ms", "wind_gusts_10m": "gust_ms",
               "wind_direction_10m": "wdir",
-              "shortwave_radiation": "swr", "cape": "cape", "uv_index": "uv"}
+              "shortwave_radiation": "swr", "cape": "cape", "uv_index": "uv",
+              "visibility": "vis"}
     panel = {}
     for mid in MODELS:
         df = pd.DataFrame(index=idx)
@@ -809,10 +1167,11 @@ def draw_alerts(fig, alerts, max_show=3):
         y -= 0.018
     return y - 0.004
 
-def draw_heatmap(ax, panel, idx, agg, sun, win=None, legend_anchor=(0.5, -0.35)):
-    """Draw the per-model-vs-consensus bikeability heatmap onto an axis.
-    Shared by the PDF overview page and the standalone report figure."""
-    sc = stack(panel, "score")
+def draw_heatmap(ax, panel, idx, agg, sun, win=None, legend_anchor=(0.5, -0.35),
+                 score_col="score", title="Hourly bikeability \u2014 each model vs the consensus"):
+    """Draw the per-model-vs-consensus suitability heatmap onto an axis.
+    Shared by the PDF overview page, the report figure, and the rowing view."""
+    sc = stack(panel, score_col)
     rows = list(panel.keys())
     mat = np.vstack([sc, sc.mean(0)])
     cats = np.digitize(mat, RATING_BINS)
@@ -825,7 +1184,7 @@ def draw_heatmap(ax, panel, idx, agg, sun, win=None, legend_anchor=(0.5, -0.35))
     ax.axhline(len(rows) - 0.5, color="white", lw=3)
     ax.set_xticks(range(0, len(idx), 2))
     ax.set_xticklabels([hlabel(idx[i]) for i in range(0, len(idx), 2)], fontsize=8)
-    ax.set_title("Hourly bikeability \u2014 each model vs the consensus", loc="left")
+    ax.set_title(title, loc="left")
     ax.tick_params(length=0)
     for t in (sun["sunrise"], sun["sunset"]):
         if t is not None:
@@ -842,12 +1201,15 @@ def draw_heatmap(ax, panel, idx, agg, sun, win=None, legend_anchor=(0.5, -0.35))
     ax.legend(handles=legend, ncol=5, fontsize=8, loc="upper center",
               bbox_to_anchor=legend_anchor, frameon=False)
 
-def fig_heatmap(panel, idx, agg, sun, win=None):
-    """Standalone bikeability heatmap figure (for the Quarto report)."""
+def fig_heatmap(panel, idx, agg, sun, win=None, score_col="score",
+                title="Hourly bikeability \u2014 each model vs the consensus"):
+    """Standalone suitability heatmap figure (cycling by default; pass
+    score_col='row_score' with a rowing title for the rowing view)."""
     rows = list(panel.keys())
     fig, ax = plt.subplots(figsize=(11, max(3.2, 0.34 * (len(rows) + 1) + 1.4)))
     fig.subplots_adjust(left=0.12, right=0.97, bottom=0.2, top=0.86)
-    draw_heatmap(ax, panel, idx, agg, sun, win, legend_anchor=(0.5, -0.22))
+    draw_heatmap(ax, panel, idx, agg, sun, win, legend_anchor=(0.5, -0.22),
+                 score_col=score_col, title=title)
     return fig
 
 def consensus_rows(idx, agg):

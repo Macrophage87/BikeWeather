@@ -836,7 +836,7 @@ def fetch_river(site=None):
     try:
         r = requests.get(USGS_IV_URL, params={
             "format": "json", "sites": site, "period": "P1D",
-            "parameterCd": "00060,00065,00010", "siteStatus": "all"},
+            "parameterCd": "00060,00065,00010", "siteStatus": "ALL"},
             headers={"User-Agent": ALERT_UA}, timeout=30)
         r.raise_for_status()
         series = r.json()["value"]["timeSeries"]

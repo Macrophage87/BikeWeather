@@ -165,6 +165,7 @@ repo). Each variable is `BIKE_` + the parameter name in upper case:
 | `BIKE_MODE` | `mode` | `both` — `bike`, `row`, or `both` |
 | `BIKE_USGS_SITE` | `usgs_site` | `01646500` (Potomac at DC; rowing) |
 | `BIKE_WATER_TEMP_C` | `water_temp_c` | `12` (manual fallback if the gauge has no temp) |
+| `BIKE_TIDE_STATION` | `tide_station` | `8594900` (NOAA CO-OPS: Washington, DC) |
 
 Parsing notes: booleans accept `1/true/yes/on`; lists are comma-separated (or a
 JSON array), and `none` clears them. Anything you don't set keeps the default
@@ -202,11 +203,14 @@ as tabs in the HTML version and as separate pages (one day per page) in the PDF:
 With `mode` set to `row` or `both`, each day also gets a **Rowing** view
 (singles / small-boat oriented): a rowing conditions heatmap (every model vs the
 consensus, scored for wind and chop, gusts, fog/visibility, and cold-water
-immersion risk) and its own "why some rowing hours rate low" callout. A single
-**River conditions now** callout above the days reports live USGS gauge flow,
-stage, trend, and water temperature (this is current, not a forecast). In `both`
-mode each day's tab holds a nested pair of tabs — **Cycling** (first) and
-**Rowing** — in the HTML build; the PDF renders them as sequential subsections.
+immersion risk), its own "why some rowing hours rate low" callout, a **wind &
+air-vs-water** chart (sustained/gust wind with singles thresholds and direction,
+over air and water temperature shaded by the cold-water immersion rule), and a
+**tide-height chart** with high/low markers (NOAA CO-OPS). A single **River
+conditions now** callout above the days reports live USGS gauge flow, stage,
+trend, and water temperature (this is current, not a forecast). In `both` mode
+each day's tab holds a nested pair of tabs — **Cycling** (first) and **Rowing** —
+in the HTML build; the PDF renders them as sequential subsections.
 
 A methodology section closes it out.
 
@@ -249,6 +253,8 @@ hour at "Avoid." The live river flow bands are **advisory** — set `ROW_*` and
   (`api.weather.gov`).
 - **River conditions (rowing):** [USGS Water Services](https://waterservices.usgs.gov)
   instantaneous values — discharge, gage height, and water temperature.
+- **Tides (rowing):** [NOAA CO-OPS](https://tidesandcurrents.noaa.gov) tide
+  predictions (hourly curve + high/low), MLLW datum.
 
 Derived comfort metrics use published methods: NWS Rothfusz heat index, Stull
 (2011) wet-bulb, the standard outdoor WBGT weighting, the NWS wind-chill

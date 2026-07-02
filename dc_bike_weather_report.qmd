@@ -106,6 +106,7 @@ mode = _env("BIKE_MODE", "both")                  # "bike", "row", or "both"
 usgs_site = _env("BIKE_USGS_SITE", "01646500")    # USGS gauge for river conditions (rowing)
 _wt = _env("BIKE_WATER_TEMP_C", "")               # manual water temp °C, if the gauge lacks it
 water_temp_c = float(_wt) if _wt else None
+tide_station = _env("BIKE_TIDE_STATION", "8594900")  # NOAA CO-OPS tide station (rowing)
 ```
 
 ```{python}
@@ -124,6 +125,7 @@ bw.configure(
     preferred_hours=preferred_hours, ride_hours=ride_hours, models=models,
     show_alerts=show_alerts, alert_email=alert_email,
     mode=mode, usgs_site=usgs_site, water_temp_c=water_temp_c,
+    tide_station=tide_station,
 )
 
 FIGDIR = "report_figs"
@@ -139,6 +141,7 @@ n_models = len(panel)
 bike_on = mode in ("bike", "both")
 row_on = mode in ("row", "both")
 river = bw.fetch_river(usgs_site) if row_on else None
+tides = bw.fetch_tides(tide_station) if row_on else None
 if row_on:
     bw.add_row_scores(panel, (river or {}).get("water_c"))
 
@@ -330,6 +333,16 @@ for di_, (d, sub) in enumerate(days):
             for n in rnotes:
                 print(f"- {n}")
             print(":::\n")
+
+        # Rowing charts: wind + air-vs-water temperature, and (if available) tides.
+        rc = save(bw.fig_row_conditions(sub, didx, agg, label, sun,
+                                        (river or {}).get("water_c")), f"rowcond_{di_}.png")
+        print(f"![Wind, and air vs water temperature]({rc}){{width=100%}}\n")
+        if tides is not None:
+            ftide = bw.fig_tides(tides, d, label, sun)
+            if ftide is not None:
+                tpth = save(ftide, f"tide_{di_}.png")
+                print(f"![Tide predictions \u2014 {label}]({tpth}){{width=100%}}\n")
 
     if both_views:
         print(":::\n")                # close the nested Cycling/Rowing tabset

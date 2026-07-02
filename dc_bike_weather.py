@@ -120,6 +120,7 @@ ROW_WATER_COLD_C = 10.0                            # water below ~50 degF -> col
 USGS_SITE = "01646500"                             # Potomac River near Washington, DC
 FLOW_ELEVATED_CFS, FLOW_HIGH_CFS = 10000, 20000    # advisory only -> set to club rules
 WATER_TEMP_C = None                                # manual fallback if gauge lacks temp
+TIDE_STATION = "8594900"                           # NOAA CO-OPS: Washington, DC (Potomac)
 # ============================================================================
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
@@ -177,6 +178,7 @@ def configure(**kw):
         "wetbulb_danger": "WETBULB_DANGER", "gust_high_mph": "GUST_HIGH_MPH",
         "gust_mod_mph": "GUST_MOD_MPH", "wind_high_mph": "WIND_HIGH_MPH",
         "mode": "MODE", "usgs_site": "USGS_SITE", "water_temp_c": "WATER_TEMP_C",
+        "tide_station": "TIDE_STATION",
         "flow_elevated_cfs": "FLOW_ELEVATED_CFS", "flow_high_cfs": "FLOW_HIGH_CFS",
         "row_wind_mod_mph": "ROW_WIND_MOD_MPH", "row_wind_high_mph": "ROW_WIND_HIGH_MPH",
         "row_gust_mod_mph": "ROW_GUST_MOD_MPH", "row_gust_high_mph": "ROW_GUST_HIGH_MPH",
@@ -871,6 +873,48 @@ def fetch_river(site=None):
         out["water_c"] = float(WATER_TEMP_C)
     return out
 
+TIDES_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+
+def fetch_tides(station=None):
+    """NOAA CO-OPS tide predictions over the forecast window: an hourly height
+    curve plus the high/low extremes. Returns a dict (curve as a pandas Series,
+    hilo as a list of (time, height, 'H'/'L')) or None on any failure. Times are
+    local naive, matching the forecast index. Never raises."""
+    station = station or TIDE_STATION
+    if not station:
+        return None
+    today = pd.Timestamp.now(tz=TZ).normalize()
+    begin = today.strftime("%Y%m%d")
+    end = (today + pd.Timedelta(days=max(FORECAST_DAYS - 1, 0))).strftime("%Y%m%d")
+    base = {"product": "predictions", "datum": "MLLW", "station": station,
+            "time_zone": "lst_ldt", "units": "english" if US else "metric",
+            "format": "json", "application": "dc-bike-weather"}
+
+    def _get(interval):
+        p = dict(base, interval=interval, begin_date=begin, end_date=end)
+        r = requests.get(TIDES_URL, params=p, headers={"User-Agent": ALERT_UA}, timeout=30)
+        r.raise_for_status()
+        return r.json().get("predictions", [])
+
+    try:
+        rows = _get("h")                                   # hourly curve
+        if not rows:
+            return None
+        t = pd.to_datetime([p["t"] for p in rows])
+        v = pd.to_numeric(pd.Series([p["v"] for p in rows]), errors="coerce")
+        curve = pd.Series(v.values, index=t)
+    except Exception as e:
+        print(f"[note] NOAA tide data unavailable ({e})")
+        return None
+    hilo = []
+    try:
+        for p in _get("hilo"):
+            hilo.append((pd.Timestamp(p["t"]), float(p["v"]), p.get("type", "")))
+    except Exception:
+        pass
+    return {"station": station, "datum": "MLLW",
+            "units": ("ft" if US else "m"), "curve": curve, "hilo": hilo}
+
 def to_panel(js):
     """dict[model_id] -> enriched hourly DataFrame (models with no data dropped)."""
     h = js["hourly"]
@@ -915,6 +959,20 @@ def nanmean0(a):
         allnan = np.all(np.isnan(a), axis=0)
         out = np.where(allnan, np.nan, np.nanmean(a, axis=0))
     return out
+
+
+def nanmin0(a):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        allnan = np.all(np.isnan(a), axis=0)
+        return np.where(allnan, np.nan, np.nanmin(a, axis=0))
+
+
+def nanmax0(a):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        allnan = np.all(np.isnan(a), axis=0)
+        return np.where(allnan, np.nan, np.nanmax(a, axis=0))
 
 
 # ---------------------------- narrative -------------------------------------
@@ -1574,6 +1632,121 @@ def fig_conditions(panel, idx, agg, date_str, sun):
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(_hax))
     ax3.set_xlabel(f"Hour (local, {TZ})")
     return fig
+
+def fig_row_conditions(panel, idx, agg, date_str, sun, water_c=None):
+    """Rowing conditions: wind & gusts (singles thresholds + direction) over air
+    vs water temperature, shaded by the cold-water immersion rule."""
+    n = len(idx)
+    fig = plt.figure(figsize=(11, 7.0))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.40,
+                          left=0.08, right=0.93, top=0.90, bottom=0.09)
+    ax1, ax2 = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
+    fig.suptitle(f"Rowing conditions \u2014 {PLACE}", fontsize=15, y=0.965)
+    fig.text(0.5, 0.925, date_str, ha="center", fontsize=9, color="#444")
+    mphd = (lambda v: v) if US else (lambda v: v * 1.60934)
+
+    # Wind & gusts with singles/small-boat thresholds and direction arrows.
+    shade_daylight(ax1, sun, idx)
+    w, g = Wd(agg["wind_mean"]), Wd(agg["gust_mean"])
+    ws = stack(panel, "wind_ms")
+    ax1.fill_between(idx, Wd(nanmin0(ws)), Wd(nanmax0(ws)),
+                     color="#1864ab", alpha=0.12, lw=0)
+    ax1.plot(idx, w, color="#1864ab", lw=2.4, label="sustained (mean)")
+    ax1.plot(idx, g, color="#d9480f", lw=1.8, label="gusts (mean)")
+    gmax = np.nanmax(g) if not np.all(np.isnan(g)) else mphd(ROW_GUST_HIGH_MPH)
+    ax1.set_ylim(0, max(gmax * 1.35, mphd(ROW_GUST_HIGH_MPH) * 1.1))
+    for thr, lab, col in [(ROW_WHITECAP_MPH, "whitecaps", "#1864ab"),
+                          (ROW_WIND_HIGH_MPH, "singles risk", "#a61e4d"),
+                          (ROW_GUST_HIGH_MPH, "hazardous gusts", "#d9480f")]:
+        if mphd(thr) < ax1.get_ylim()[1]:
+            ax1.axhline(mphd(thr), color=col, lw=0.8, ls=":", alpha=0.7)
+            ax1.text(idx[-1], mphd(thr), f"{lab} ", fontsize=6.4, color=col,
+                     va="bottom", ha="right")
+    wdir = agg.get("wdir_hourly")
+    if wdir is not None and not np.all(np.isnan(wdir)):
+        yt = ax1.get_ylim()[1] * 0.92
+        for k in range(0, n, 3):
+            if not np.isnan(wdir[k]):
+                R = 90 - ((wdir[k] + 180) % 360)          # blow-to bearing -> screen angle
+                ax1.text(idx[k], yt, "\u2192", rotation=R, rotation_mode="anchor",
+                         ha="center", va="center", fontsize=12, color="#555")
+    prevail = compass(agg.get("prevailing_dir")) if agg.get("prevailing_dir") is not None else None
+    ax1.set_ylabel(f"Wind ({WU})")
+    ax1.set_title("Wind \u2014 sustained & gusts"
+                  + (f"  (prevailing from {prevail}; arrows = direction)" if prevail else ""),
+                  loc="left")
+    ax1.legend(fontsize=7, loc="upper left", framealpha=0.9)
+
+    # Air vs water temperature, with cold-water immersion zones on the air axis.
+    shade_daylight(ax2, sun, idx)
+    air = Td(agg["air_mean"])
+    ts = stack(panel, "t_c")
+    alo, ahi = Td(nanmin0(ts)), Td(nanmax0(ts))
+    ax2.fill_between(idx, alo, ahi, color="#e8590c", alpha=0.12, lw=0)
+    ax2.plot(idx, air, color="#e8590c", lw=2.4, label="air (mean)")
+    ymax = np.nanmax(ahi)
+    if water_c is not None and water_c == water_c:
+        wl = Td(water_c)
+        ax2.axhline(wl, color="#1971c2", lw=2.0, label=f"water {wl:.0f}{TU}")
+        tf_disp = (lambda f: f) if US else (lambda f: (f - 32) * 5 / 9)
+        water_f = water_c * 9 / 5 + 32
+        a_caut = tf_disp(ROW_COLDWATER_SUM_F - water_f)   # air below -> combined caution
+        a_dang = tf_disp(ROW_COLDWATER_DANGER_F - water_f)
+        air_min = np.nanmin(alo)
+        if a_caut >= air_min - 2:                         # cold-water rule is in play
+            lo = min(air_min, wl, a_dang) - 2
+            ax2.axhspan(lo, a_caut, color="#f1c40f", alpha=0.13, lw=0)
+            ax2.axhspan(lo, a_dang, color="#e03131", alpha=0.15, lw=0)
+            ax2.text(idx[0], a_caut, " air+water caution", fontsize=6.4,
+                     color="#b8860b", va="bottom")
+            ax2.text(idx[0], a_dang, " singles unsafe", fontsize=6.4,
+                     color="#c92a2a", va="bottom")
+            ax2.set_ylim(lo, ymax + 2)
+    ax2.set_ylabel(f"Temp ({TU})")
+    ax2.set_title("Air vs water \u2014 shaded = cold-water immersion risk", loc="left")
+    ax2.legend(fontsize=7, loc="upper right", framealpha=0.9)
+
+    for ax in (ax1, ax2):
+        ax.set_xlim(idx[0], idx[-1])
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(_hax))
+    ax2.set_xlabel(f"Hour (local, {TZ})")
+    return fig
+
+
+def fig_tides(tides, day, date_str, sun):
+    """Tide-height curve for one day with high/low markers. Returns None if the
+    predictions don't cover that day."""
+    if not tides or tides.get("curve") is None:
+        return None
+    curve = tides["curve"]
+    d0 = pd.Timestamp(day).normalize(); d1 = d0 + pd.Timedelta(days=1)
+    seg = curve[(curve.index >= d0) & (curve.index < d1)]
+    if seg.empty:
+        return None
+    unit = tides.get("units", "ft")
+    fig, ax = plt.subplots(figsize=(11, 3.2))
+    fig.subplots_adjust(left=0.08, right=0.96, top=0.82, bottom=0.22)
+    shade_daylight(ax, sun, seg.index)
+    ax.plot(seg.index, seg.values, color="#0b7285", lw=2.2)
+    ax.fill_between(seg.index, seg.values, np.nanmin(seg.values),
+                    color="#0b7285", alpha=0.10)
+    for t, v, typ in tides.get("hilo", []):
+        if d0 <= t < d1:
+            ax.plot(t, v, "o", color="#0b7285", ms=5)
+            lab = "High" if typ == "H" else "Low" if typ == "L" else ""
+            ax.annotate(f"{lab} {hm(t)}\n{v:.1f} {unit}", (t, v),
+                        xytext=(0, 8 if typ == "H" else -20), textcoords="offset points",
+                        ha="center", fontsize=7, color="#0b7285")
+    ax.set_title(f"Tide predictions ({tides.get('datum', 'MLLW')}) \u2014 {date_str}",
+                 loc="left")
+    ax.set_ylabel(f"Height ({unit})")
+    ax.set_xlim(seg.index[0], seg.index[-1])
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_hax))
+    ax.set_xlabel(f"Hour (local, {TZ})")
+    return fig
+
 
 def page_precip_severe(pdf, panel, idx, agg, date_str, sun):
     fig = fig_conditions(panel, idx, agg, date_str, sun)

@@ -107,6 +107,14 @@ usgs_site = _env("BIKE_USGS_SITE", "01646500")    # USGS gauge for river conditi
 _wt = _env("BIKE_WATER_TEMP_C", "")               # manual water temp °C, if the gauge lacks it
 water_temp_c = float(_wt) if _wt else None
 tide_station = _env("BIKE_TIDE_STATION", "8594900")  # NOAA CO-OPS tide station (rowing)
+
+# Water speed over time at the rowing site (continuity estimate: gauge discharge
+# + tidal fill/drain, over the channel cross-section). Defaults describe the
+# Potomac at Thompson Boat Center; tune for another dock.
+row_site = _env("BIKE_ROW_SITE", "Thompson Boat Center")
+channel_width_m = _envf("BIKE_CHANNEL_WIDTH_M", 350.0)     # river width at the dock (m)
+channel_depth_m = _envf("BIKE_CHANNEL_DEPTH_M", 5.5)       # mean mid-channel depth (m)
+tidal_area_upstream_m2 = _envf("BIKE_TIDAL_AREA_M2", 2.0e6)  # tidal surface upstream (m^2)
 ```
 
 ```{python}
@@ -125,7 +133,9 @@ bw.configure(
     preferred_hours=preferred_hours, ride_hours=ride_hours, models=models,
     show_alerts=show_alerts, alert_email=alert_email,
     mode=mode, usgs_site=usgs_site, water_temp_c=water_temp_c,
-    tide_station=tide_station,
+    tide_station=tide_station, row_site=row_site,
+    channel_width_m=channel_width_m, channel_depth_m=channel_depth_m,
+    tidal_area_upstream_m2=tidal_area_upstream_m2,
 )
 
 FIGDIR = "report_figs"
@@ -144,6 +154,9 @@ river = bw.fetch_river(usgs_site) if row_on else None
 tides = bw.fetch_tides(tide_station) if row_on else None
 if row_on:
     bw.add_row_scores(panel, (river or {}).get("water_c"))
+# Estimated water speed over time at the rowing site (river + tidal current).
+current = (bw.estimate_current(panel[next(iter(panel))].index, river, tides)
+           if row_on else None)
 
 # Split into per-day frames AFTER rowing scores are attached, so each day carries them.
 days = bw.split_by_day(panel)
@@ -212,7 +225,7 @@ if alerts:
 #| output: asis
 # Live USGS river conditions (rowing only) — shown once; this is current, not a forecast.
 if row_on:
-    rn = bw.river_notes(river)
+    rn = bw.river_notes(river, current)
     if rn:
         kind, title, lines = rn
         print(f"::: {{.callout-{kind} title='{title}'}}")
@@ -343,6 +356,14 @@ for di_, (d, sub) in enumerate(days):
             if ftide is not None:
                 tpth = save(ftide, f"tide_{di_}.png")
                 print(f"![Tide predictions \u2014 {label}]({tpth}){{width=100%}}\n")
+        # Water speed over time at the rowing site: river throughflow (live
+        # USGS discharge) modulated by the predicted tide (ebb/flood).
+        cur_day = bw.estimate_current(didx, river, tides)
+        if cur_day is not None:
+            fcur = bw.fig_current(cur_day, didx, label, sun, river)
+            cpth = save(fcur, f"current_{di_}.png")
+            print(f"![Estimated water speed over time \u2014 {bw.ROW_SITE}]"
+                  f"({cpth}){{width=100%}}\n")
 
     if both_views:
         print(":::\n")                # close the nested Cycling/Rowing tabset

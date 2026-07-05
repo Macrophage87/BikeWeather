@@ -121,6 +121,18 @@ USGS_SITE = "01646500"                             # Potomac River near Washingt
 FLOW_ELEVATED_CFS, FLOW_HIGH_CFS = 10000, 20000    # advisory only -> set to club rules
 WATER_TEMP_C = None                                # manual fallback if gauge lacks temp
 TIDE_STATION = "8594900"                           # NOAA CO-OPS: Washington, DC (Potomac)
+# Water speed over time at the rowing site. Thompson Boat Center sits on the
+# tidal Potomac at the mouth of Rock Creek — too far upriver for any NOAA
+# current-prediction station — so the surface current is estimated from
+# continuity: (river discharge + tidal fill/drain of the reach upstream of the
+# dock) / channel cross-section. A rising tide pushes water upstream past the
+# dock (flood); a falling tide adds to the downstream flow (ebb). The reach
+# parameters below describe the Potomac at Thompson Boat Center up to the head
+# of tide near Chain Bridge; tune them for another site.
+ROW_SITE = "Thompson Boat Center"
+CHANNEL_WIDTH_M = 350.0                            # river width at the dock (m)
+CHANNEL_DEPTH_M = 5.5                              # mean mid-channel depth (m)
+TIDAL_AREA_UPSTREAM_M2 = 2.0e6                     # water surface the tide fills/drains upstream (m^2)
 # ============================================================================
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
@@ -178,7 +190,9 @@ def configure(**kw):
         "wetbulb_danger": "WETBULB_DANGER", "gust_high_mph": "GUST_HIGH_MPH",
         "gust_mod_mph": "GUST_MOD_MPH", "wind_high_mph": "WIND_HIGH_MPH",
         "mode": "MODE", "usgs_site": "USGS_SITE", "water_temp_c": "WATER_TEMP_C",
-        "tide_station": "TIDE_STATION",
+        "tide_station": "TIDE_STATION", "row_site": "ROW_SITE",
+        "channel_width_m": "CHANNEL_WIDTH_M", "channel_depth_m": "CHANNEL_DEPTH_M",
+        "tidal_area_upstream_m2": "TIDAL_AREA_UPSTREAM_M2",
         "flow_elevated_cfs": "FLOW_ELEVATED_CFS", "flow_high_cfs": "FLOW_HIGH_CFS",
         "row_wind_mod_mph": "ROW_WIND_MOD_MPH", "row_wind_high_mph": "ROW_WIND_HIGH_MPH",
         "row_gust_mod_mph": "ROW_GUST_MOD_MPH", "row_gust_high_mph": "ROW_GUST_HIGH_MPH",
@@ -611,10 +625,11 @@ def row_low_rating_notes(panel, idx, water_c=None):
                              _row_reason_phrases)
 
 
-def river_notes(river):
+def river_notes(river, cur=None):
     """(callout_kind, headline, [lines]) summarising live USGS river conditions,
     or None when nothing was returned. Flow/stage/water temperature are 'now',
-    not a forecast."""
+    not a forecast. Pass an estimate_current() result as cur to include the
+    water speed at the rowing site right now."""
     if not river or (river.get("flow_cfs") is None and river.get("water_c") is None):
         return None
     kind, lines = "note", []
@@ -631,6 +646,15 @@ def river_notes(river):
         elif flow >= FLOW_ELEVATED_CFS:
             kind = "warning"
             lines.append("Elevated flow \u2014 stronger current than usual; stay near shore.")
+    if cur is not None:
+        s = cur["speed_ms"]
+        now = pd.Timestamp.now(tz=TZ).tz_localize(None)
+        i = int(np.argmin(np.abs((s.index - now) / pd.Timedelta(seconds=1))))
+        v = float(Wd(s.values[i]))
+        direction = "downstream" if s.values[i] >= 0 else "upstream (flood)"
+        tidal = "tide-modulated; " if np.any(cur["tidal_ms"] != 0) else ""
+        lines.append(f"Estimated current at {ROW_SITE} **{abs(v):.1f} {WU}** "
+                     f"{direction} \u2014 {tidal}see the speed-over-time chart.")
     if w is not None:
         lines.append(f"Water temperature **{Td(w):.0f}{TU}**.")
         if w < ROW_WATER_COLD_C:
@@ -652,7 +676,14 @@ def row_methodology_text():
         "singles are unsafe. Any thunder or strong instability caps the hour at Avoid. "
         "Flow, stage and water temperature are live from the USGS gauge and reflect "
         "current conditions, not a forecast; the flow bands are advisory \u2014 set them "
-        "to your club's rules.")
+        f"to your club's rules. Water speed over time at {ROW_SITE} is a continuity "
+        "estimate \u2014 no NOAA current-prediction station exists this far up the "
+        "tidal Potomac \u2014 combining the live gauge discharge spread over the channel "
+        f"cross-section ({CHANNEL_WIDTH_M:.0f} m \u00d7 {CHANNEL_DEPTH_M:.1f} m) with "
+        "the tide curve's rise/fall filling or draining the reach upstream of the dock "
+        f"({TIDAL_AREA_UPSTREAM_M2 / 1e6:.1f} km\u00b2 to the head of tide). Positive is "
+        "downstream (ebb); a fast-rising tide over a low river can briefly run the "
+        "current upstream (flood). Treat it as planning guidance, not measurement.")
 
 
 def wind_chill_c(t_c, w_kmh):
@@ -914,6 +945,43 @@ def fetch_tides(station=None):
         pass
     return {"station": station, "datum": "MLLW",
             "units": ("ft" if US else "m"), "curve": curve, "hilo": hilo}
+
+CFS_TO_M3S = 0.0283168
+
+def estimate_current(idx, river, tides):
+    """Estimated hourly water speed at the rowing site (ROW_SITE) over the
+    forecast index, by continuity:
+
+      * river term — live USGS discharge spread over the channel cross-section
+        (CHANNEL_WIDTH_M x CHANNEL_DEPTH_M). The gauge reports 'now', so this
+        term is constant across the window.
+      * tidal term — the predicted tide curve's rate of rise/fall times the
+        water surface upstream of the dock (TIDAL_AREA_UPSTREAM_M2). A rising
+        tide pushes water upstream past the dock, a falling tide adds to the
+        downstream flow. Zero outside the tide curve's coverage.
+
+    Positive = downstream (ebb direction), negative = upstream (flood).
+    Returns {"speed_ms": Series over idx, "river_ms": float, "tidal_ms": array,
+    "area_m2": float} or None when the gauge gave no discharge."""
+    flow = (river or {}).get("flow_cfs")
+    if flow is None:
+        return None
+    area = CHANNEL_WIDTH_M * CHANNEL_DEPTH_M
+    v_river = flow * CFS_TO_M3S / area
+    v_tide = np.zeros(len(idx))
+    curve = (tides or {}).get("curve")
+    if curve is not None and len(curve) >= 3:
+        h_m = curve.values.astype(float) * (0.3048 if tides.get("units") == "ft" else 1.0)
+        sec = pd.Timedelta(seconds=1)                      # resolution-independent
+        tsec = ((curve.index - curve.index[0]) / sec).to_numpy(float)
+        dhdt = np.gradient(h_m, tsec)                      # rise rate, m/s
+        xi = ((idx - curve.index[0]) / sec).to_numpy(float)
+        inside = (xi >= tsec[0]) & (xi <= tsec[-1])
+        v_tide = np.where(inside, np.interp(xi, tsec, dhdt), 0.0) \
+            * (-TIDAL_AREA_UPSTREAM_M2 / area)
+    speed = v_river + v_tide
+    return {"speed_ms": pd.Series(speed, index=idx), "river_ms": float(v_river),
+            "tidal_ms": v_tide, "area_m2": area}
 
 def to_panel(js):
     """dict[model_id] -> enriched hourly DataFrame (models with no data dropped)."""
@@ -1742,6 +1810,52 @@ def fig_tides(tides, day, date_str, sun):
                  loc="left")
     ax.set_ylabel(f"Height ({unit})")
     ax.set_xlim(seg.index[0], seg.index[-1])
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_hax))
+    ax.set_xlabel(f"Hour (local, {TZ})")
+    return fig
+
+
+def fig_current(cur, idx, date_str, sun, river=None):
+    """Water speed over time at the rowing site: estimated surface current from
+    the live river discharge, modulated by the predicted tide. Positive =
+    downstream (ebb); dips toward or below zero = flood pushing upstream."""
+    if cur is None:
+        return None
+    v = Wd(cur["speed_ms"].values)
+    vr = float(Wd(cur["river_ms"]))
+    fig, ax = plt.subplots(figsize=(11, 3.2))
+    fig.subplots_adjust(left=0.08, right=0.96, top=0.82, bottom=0.22)
+    shade_daylight(ax, sun, idx)
+    ax.plot(idx, v, color="#5f3dc4", lw=2.2)
+    ax.fill_between(idx, v, 0, color="#5f3dc4", alpha=0.10)
+    ax.axhline(0, color="#555", lw=0.8)
+    ax.axhline(vr, color="#5f3dc4", lw=1.0, ls="--", alpha=0.7)
+    ax.text(idx[0], vr, " river flow alone", fontsize=6.4, color="#5f3dc4",
+            va="bottom")
+    ax.set_ylim(min(0, np.nanmin(v)) - 0.1, max(np.nanmax(v) * 1.3, vr * 1.5, 0.5))
+    # Advisory speeds implied by the flow bands through the same cross-section.
+    for cfs, lab, col in [(FLOW_ELEVATED_CFS, "elevated-flow speed", "#b8860b"),
+                          (FLOW_HIGH_CFS, "high-flow speed", "#c92a2a")]:
+        thr = float(Wd(cfs * CFS_TO_M3S / cur["area_m2"]))
+        if thr < ax.get_ylim()[1]:
+            ax.axhline(thr, color=col, lw=0.8, ls=":", alpha=0.7)
+            ax.text(idx[-1], thr, f"{lab} ", fontsize=6.2, color=col,
+                    va="bottom", ha="right")
+    ip = int(np.nanargmax(v))
+    ax.annotate(f"peak {v[ip]:.1f} {WU} ~{hlabel(idx[ip])}", (idx[ip], v[ip]),
+                xytext=(0, 6), textcoords="offset points", ha="center",
+                fontsize=7.5, color="#5f3dc4")
+    if np.nanmin(v) < 0:
+        ax.text(idx[0], np.nanmin(v), " below 0 = flood current (upstream)",
+                fontsize=6.4, color="#555", va="bottom")
+    flow = (river or {}).get("flow_cfs")
+    src = (f"USGS {flow:,.0f} cfs now + NOAA predicted tide" if flow is not None
+           else "NOAA predicted tide")
+    ax.set_title(f"Estimated water speed \u2014 {ROW_SITE} ({src}) \u2014 {date_str}",
+                 loc="left")
+    ax.set_ylabel(f"Speed ({WU})")
+    ax.set_xlim(idx[0], idx[-1])
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(_hax))
     ax.set_xlabel(f"Hour (local, {TZ})")

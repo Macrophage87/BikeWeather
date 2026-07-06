@@ -166,6 +166,10 @@ repo). Each variable is `BIKE_` + the parameter name in upper case:
 | `BIKE_USGS_SITE` | `usgs_site` | `01646500` (Potomac at DC; rowing) |
 | `BIKE_WATER_TEMP_C` | `water_temp_c` | `12` (manual fallback if the gauge has no temp) |
 | `BIKE_TIDE_STATION` | `tide_station` | `8594900` (NOAA CO-OPS: Washington, DC) |
+| `BIKE_ROW_SITE` | `row_site` | `Thompson Boat Center` (name shown on the water-speed chart) |
+| `BIKE_CHANNEL_WIDTH_M` | `channel_width_m` | `350` (river width at the dock, m; rowing) |
+| `BIKE_CHANNEL_DEPTH_M` | `channel_depth_m` | `5.5` (mean mid-channel depth, m; rowing) |
+| `BIKE_TIDAL_AREA_M2` | `tidal_area_upstream_m2` | `2.0e6` (tidal surface upstream of the dock, m²; rowing) |
 
 Parsing notes: booleans accept `1/true/yes/on`; lists are comma-separated (or a
 JSON array), and `none` clears them. Anything you don't set keeps the default
@@ -206,9 +210,16 @@ consensus, scored for wind and chop, gusts, fog/visibility, and cold-water
 immersion risk), its own "why some rowing hours rate low" callout, a **wind &
 air-vs-water** chart (sustained/gust wind with singles thresholds and direction,
 over air and water temperature shaded by the cold-water immersion rule), and a
-**tide-height chart** with high/low markers (NOAA CO-OPS). A single **River
-conditions now** callout above the days reports live USGS gauge flow, stage,
-trend, and water temperature (this is current, not a forecast). In `both` mode
+**tide-height chart** with high/low markers (NOAA CO-OPS), and an **estimated
+water-speed-over-time chart** for the rowing site (default: Thompson Boat
+Center). The water speed is a continuity estimate — there is no NOAA
+current-prediction station that far up the tidal Potomac — combining the live
+USGS discharge spread over the channel cross-section with the tide curve's
+rise/fall filling or draining the reach upstream of the dock: positive is
+downstream (ebb), and a fast-rising tide over a low river can briefly run the
+current upstream (flood). A single **River conditions now** callout above the
+days reports live USGS gauge flow, stage, trend, water temperature, and the
+estimated current at the dock right now (this is current, not a forecast). In `both` mode
 each day's tab holds a nested pair of tabs — **Cycling** (first) and **Rowing** —
 in the HTML build; the PDF renders them as sequential subsections.
 

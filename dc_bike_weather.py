@@ -10,6 +10,7 @@ models across the things that actually matter on a bike:
                      wet-bulb temperature, and WBGT heat-stress index
     * Precipitation — amount and rain chance, model by model
     * Severe risk   — CAPE (thunderstorm energy), WMO thunderstorm codes, gusts
+    * Air quality   — hourly US EPA AQI (Open-Meteo air-quality API, CAMS)
     * A composite hourly "bikeability" rating, shown per-model so you can see
       where the models agree and where they don't.
 
@@ -133,6 +134,14 @@ ROW_SITE = "Thompson Boat Center"
 CHANNEL_WIDTH_M = 350.0                            # river width at the dock (m)
 CHANNEL_DEPTH_M = 5.5                              # mean mid-channel depth (m)
 TIDAL_AREA_UPSTREAM_M2 = 2.0e6                     # water surface the tide fills/drains upstream (m^2)
+
+# --- Air quality (US EPA AQI) ------------------------------------------------
+# Hourly AQI forecast from Open-Meteo's free air-quality API (CAMS). Once the
+# day reaches the "unhealthy for sensitive groups" band the AQI subtracts from
+# both the bikeability and rowing scores (hard exercise multiplies intake).
+SHOW_AQI = True
+AQI_API_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+AQI_USG, AQI_UNHEALTHY, AQI_VERY_UNHEALTHY, AQI_HAZARDOUS = 101, 151, 201, 301
 # ============================================================================
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
@@ -146,6 +155,11 @@ BASE_VARS = CORE_VARS + ["cape"]
 UV_BANDS = [(2.5, "Low", "#4eb400"), (5.5, "Moderate", "#f7e400"),
             (7.5, "High", "#f85900"), (10.5, "Very High", "#d8001d"),
             (99.0, "Extreme", "#998cff")]
+
+# US EPA AQI categories: upper bound (exclusive), label, color (EPA palette).
+AQI_BANDS = [(51, "Good", "#00e400"), (101, "Moderate", "#f7d708"),
+             (151, "Sensitive groups", "#ff7e00"), (201, "Unhealthy", "#ff0000"),
+             (301, "Very unhealthy", "#8f3f97"), (1e9, "Hazardous", "#7e0023")]
 
 # Wind-chill (feels-like cold) categories: lower bound (degC), label, color.
 # Bands approximate NWS frostbite-risk guidance for exposed skin.
@@ -186,6 +200,7 @@ def configure(**kw):
         "lat": "LAT", "lon": "LON", "tz": "TZ", "forecast_days": "FORECAST_DAYS",
         "units": "UNITS", "outfile": "OUTFILE", "have_light": "HAVE_LIGHT",
         "ride_hours": "RIDE_HOURS", "show_alerts": "SHOW_ALERTS",
+        "show_aqi": "SHOW_AQI",
         "alert_ua": "ALERT_UA", "nws_alerts_url": "NWS_ALERTS_URL",
         "wetbulb_danger": "WETBULB_DANGER", "gust_high_mph": "GUST_HIGH_MPH",
         "gust_mod_mph": "GUST_MOD_MPH", "wind_high_mph": "WIND_HIGH_MPH",
@@ -255,6 +270,15 @@ def uv_band(uv):
         if uv < hi:
             return (label, color)
     return UV_BANDS[-1][1:]
+
+def aqi_band(aqi):
+    """(label, color) for a US EPA AQI value."""
+    if aqi is None or np.isnan(aqi):
+        return ("--", "#999999")
+    for hi, label, color in AQI_BANDS:
+        if aqi < hi:
+            return (label, color)
+    return AQI_BANDS[-1][1:]
 
 def sun_times(lat, lon, d):
     """Sunrise, sunset and civil dawn/dusk for a date, via the NOAA solar
@@ -375,19 +399,33 @@ def penalty_components(df):
     sevp = np.select([sev >= 4, sev >= 3, sev >= 2, sev >= 1], [80, 55, 30, 10], 0)
     wind = (np.where(gmph > GUST_HIGH_MPH, 25, np.where(gmph > GUST_MOD_MPH, 12, 0))
             + np.where(wmph > WIND_HIGH_MPH, 10, 0))
+    airq, aqi = aqi_penalty(df)
     return {
         "heat": heat, "cold": cold, "rain": rain, "severe": sevp, "wind": wind,
+        "airq": airq, "aqi": aqi,
         "capped": (np.asarray(thunder, bool) | (sev >= 3)),        # storms -> Avoid
         "wbgt_c": wbgt, "tw_c": tw, "hi_c": hi_c, "t_c": t_c,
         "precip": precip, "gust_ms": gms, "wind_ms": wms,
         "sev": sev, "thunder": np.asarray(thunder, bool),
     }
 
+def aqi_penalty(df):
+    """(penalty array, raw AQI array) for the hourly US AQI attached by
+    attach_aqi(). Zero below the 'unhealthy for sensitive groups' band — hard
+    exercise multiplies pollutant intake, so the bands bite earlier than the
+    everyday EPA guidance. Shared by the cycling and rowing scores."""
+    aqi = (df["aqi"].values.astype(float) if "aqi" in df
+           else np.full(len(df), np.nan))
+    with np.errstate(invalid="ignore"):
+        pen = np.select([aqi >= AQI_HAZARDOUS, aqi >= AQI_VERY_UNHEALTHY,
+                         aqi >= AQI_UNHEALTHY, aqi >= AQI_USG], [80, 60, 40, 15], 0)
+    return pen, aqi
+
 def suitability(df):
     """Composite 0-100 bikeability score for one model's hourly frame."""
     c = penalty_components(df)
     score = np.clip(100 - (c["heat"] + c["cold"] + c["rain"]
-                           + c["severe"] + c["wind"]), 0, 100)
+                           + c["severe"] + c["wind"] + c["airq"]), 0, 100)
     cap = np.where(c["capped"], 25, 100)                    # storms -> Avoid
     return np.minimum(score, cap)
 
@@ -432,6 +470,11 @@ def _reason_phrases(c, i):
         word = ("heavy rain" if c["rain"][i] >= 45
                 else "moderate rain" if c["rain"][i] >= 25 else "light rain")
         out.append((float(c["rain"][i]), word, "rain"))
+    # Air quality.
+    if c["airq"][i] > 0:
+        out.append((float(c["airq"][i]),
+                    f"poor air quality (AQI {c['aqi'][i]:.0f}, "
+                    f"{aqi_band(c['aqi'][i])[0]})", "air"))
     # Wind: gusts and/or sustained.
     if c["wind"][i] > 0:
         parts = []
@@ -559,7 +602,9 @@ def row_penalty_components(df, water_c=None):
         summ = t_f + (water_c * 9 / 5 + 32)
         cold = np.select([summ < ROW_COLDWATER_DANGER_F, water_c < ROW_WATER_COLD_C,
                           summ < ROW_COLDWATER_SUM_F], [70, 55, 30], 0)
+    airq, aqi = aqi_penalty(df)
     return {"wind": wind, "gust": gust, "fog": fog, "cold": cold,
+            "airq": airq, "aqi": aqi,
             "capped": (thunder | (sev >= 3)),
             "wind_ms": wms, "gust_ms": gms, "wmph": wmph, "gmph": gmph,
             "vis": vis, "fog_low": fog_low, "fog_mod": fog_mod,
@@ -570,7 +615,8 @@ def row_penalty_components(df, water_c=None):
 def row_suitability(df, water_c=None):
     """Composite 0-100 rowing score for one model's hourly frame."""
     c = row_penalty_components(df, water_c)
-    score = np.clip(100 - (c["wind"] + c["gust"] + c["fog"] + c["cold"]), 0, 100)
+    score = np.clip(100 - (c["wind"] + c["gust"] + c["fog"] + c["cold"]
+                           + c["airq"]), 0, 100)
     cap = np.where(c["capped"], 25, 100)                    # storms -> Avoid
     return np.minimum(score, cap)
 
@@ -604,6 +650,10 @@ def _row_reason_phrases(c, i):
         else:
             txt = "reduced visibility"
         out.append((float(c["fog"][i]), txt, "fog"))
+    if c["airq"][i] > 0:
+        out.append((float(c["airq"][i]),
+                    f"poor air quality (AQI {c['aqi'][i]:.0f}, "
+                    f"{aqi_band(c['aqi'][i])[0]})", "air"))
     if c["wind"][i] > 0 or c["gust"][i] > 0:
         bits = []
         if c["wmph"][i] >= ROW_WHITECAP_MPH:
@@ -753,6 +803,42 @@ COLD_ADVICE = {
     "Dangerous": ["Frostbite can set in within ~30 minutes \u2014 better to skip or ride indoors.",
                   "If you do ride, fully cover skin and keep it brief."],
 }
+AQI_ADVICE = {
+    "Sensitive groups": ["Sensitive groups (asthma, heart or lung disease) should shorten "
+                         "the workout and keep the effort easy.",
+                         "Ozone usually peaks mid-afternoon \u2014 a morning start helps."],
+    "Unhealthy": ["Everyone: keep it short and easy, or move the workout indoors.",
+                  "Hard breathing multiplies pollutant intake \u2014 skip intervals.",
+                  "Watch for coughing, chest tightness or unusual fatigue and stop if they show."],
+    "Very unhealthy": ["Move the workout indoors \u2014 hard breathing outdoors is not advised.",
+                       "If you must be out, keep it brief and gentle."],
+    "Hazardous": ["Stay indoors \u2014 avoid all outdoor exertion."],
+}
+
+
+def aqi_flags(idx, aqi_series):
+    """Air-quality assessment for one day from the hourly AQI forecast.
+    concern=True once the day reaches the 'unhealthy for sensitive groups'
+    band (AQI >= AQI_USG)."""
+    out = {"concern": False, "recommendations": []}
+    if aqi_series is None:
+        return out
+    v = aqi_series.reindex(idx).values.astype(float)
+    out["aqi"] = v
+    if np.all(np.isnan(v)):
+        return out
+    ip = int(np.nanargmax(v)); peak = float(v[ip])
+    band = aqi_band(peak)[0]
+    out.update(peak_aqi=peak, peak_hour=idx[ip], band=band,
+               concern=peak >= AQI_USG)
+    with np.errstate(invalid="ignore"):
+        out["windows"] = {lab: window_text(idx, v >= thr) for lab, thr in
+                          (("Sensitive groups", AQI_USG), ("Unhealthy", AQI_UNHEALTHY),
+                           ("Very unhealthy", AQI_VERY_UNHEALTHY),
+                           ("Hazardous", AQI_HAZARDOUS))}
+    if out["concern"]:
+        out["recommendations"] = AQI_ADVICE.get(band, AQI_ADVICE["Sensitive groups"])
+    return out
 
 
 def heat_flags(idx, agg):
@@ -856,6 +942,54 @@ def fetch_alerts():
     except Exception as e:
         print(f"[note] NWS alerts unavailable ({e})")
         return []
+
+def fetch_air_quality():
+    """Hourly US EPA AQI forecast (plus the main pollutants) from Open-Meteo's
+    air-quality API (CAMS). Returns {"aqi": Series, "pm2_5": Series|None,
+    "pm10": Series|None, "ozone": Series|None} with naive local timestamps
+    matching the forecast index, or None when disabled or on any failure.
+    Never raises (mirrors fetch_alerts)."""
+    if not SHOW_AQI:
+        return None
+    try:
+        r = requests.get(AQI_API_URL, params={
+            "latitude": LAT, "longitude": LON,
+            "hourly": "us_aqi,pm2_5,pm10,ozone",
+            "timezone": TZ, "forecast_days": FORECAST_DAYS}, timeout=30)
+        r.raise_for_status()
+        h = r.json()["hourly"]
+        idx = pd.to_datetime(h["time"])
+
+        def series(key):
+            vals = h.get(key)
+            if vals is None:
+                return None
+            s = pd.to_numeric(pd.Series(vals, index=idx), errors="coerce")
+            return s if s.notna().any() else None
+
+        aqi = series("us_aqi")
+        if aqi is None:
+            return None
+        return {"aqi": aqi, "pm2_5": series("pm2_5"),
+                "pm10": series("pm10"), "ozone": series("ozone")}
+    except Exception as e:
+        print(f"[note] air-quality data unavailable ({e})")
+        return None
+
+
+def attach_aqi(panel, aq):
+    """Attach the hourly AQI forecast to every model frame and recompute the
+    bikeability score so the air-quality penalty applies. Call before
+    add_row_scores so the rowing score picks it up too. The AQI forecast is a
+    single (CAMS) model, so every weather model gets the same series."""
+    if not aq:
+        return panel
+    for m in panel:
+        df = panel[m]
+        df["aqi"] = aq["aqi"].reindex(df.index).values.astype(float)
+        df["score"] = suitability(df)
+    return panel
+
 
 USGS_IV_URL = "https://waterservices.usgs.gov/nwis/iv/"
 
@@ -1193,6 +1327,13 @@ def summarize(panel, idx, agg, sun):
         bullets.append(f"Peak UV {uvm[iu]:.0f} ({uv_band(uvm[iu])[0]}) ~{hlabel(idx[iu])} "
                        f"\u2014 sunscreen / sunglasses on long midday rides.")
 
+    am = agg.get("aqi_mean")
+    if am is not None and not np.all(np.isnan(am)):
+        ia = int(np.nanargmax(am))
+        note = " \u2014 scores are docked for it." if am[ia] >= AQI_USG else "."
+        bullets.append(f"Air quality: peak AQI {am[ia]:.0f} "
+                       f"({aqi_band(am[ia])[0]}) ~{hlabel(idx[ia])}{note}")
+
     rain_mask = (agg["agree"] >= 40) | (agg["pr_mean"] >= 0.2)
     bullets.append(f"Rain likely: {fmt_runs(rain_mask, idx)} "
                    f"(peak model agreement {agg['agree'].max():.0f}%).")
@@ -1342,16 +1483,19 @@ def consensus_rows(idx, agg):
     """Header + 3-hourly consensus table rows + per-row rating index.
     Shared by the PDF table and the report's HTML table."""
     sel = list(range(0, len(idx), 3))
-    head = ["Hr", "Air", "HI", "WBlb", "Sun", "UV", "Rn%", "CAPE", "Rating"]
+    head = ["Hr", "Air", "HI", "WBlb", "Sun", "UV", "AQI", "Rn%", "CAPE", "Rating"]
+    am = agg.get("aqi_mean")
     cells, rate_idx = [], []
     for i in sel:
         rate_i = int(np.digitize(agg["sc_mean"][i], RATING_BINS))
         cape_v = agg["cape_mean"][i]; uv_v = agg["uv_mean"][i]
+        aqi_v = am[i] if am is not None else np.nan
         cells.append([
             hlabel(idx[i]), f"{Td(agg['air_mean'][i]):.0f}",
             f"{Td(agg['hi_mean'][i]):.0f}", f"{Td(agg['tw_mean'][i]):.0f}",
             f"{Td(agg['tg_mean'][i]):.0f}",
             "-" if np.isnan(uv_v) else f"{uv_v:.0f}",
+            "-" if np.isnan(aqi_v) else f"{aqi_v:.0f}",
             f"{agg['agree'][i]:.0f}",
             "-" if np.isnan(cape_v) else f"{cape_v:.0f}",
             RATING_LABELS[rate_i],
@@ -1393,6 +1537,10 @@ def methodology_text():
         "are capped at Avoid.  AI models (AIFS, GraphCast) supply temp/precip/wind but not "
         "CAPE or radiation, so their severe/sun cells may be blank and heat falls back to heat "
         "index.  UV index is the WHO scale (Low<3, Moderate, High, Very High, Extreme>10).  "
+        "Air quality is the hourly US EPA AQI forecast (Open-Meteo air-quality API, CAMS); "
+        f"from AQI {AQI_USG} (unhealthy for sensitive groups) it subtracts from both the "
+        "cycling and rowing scores — hard exercise multiplies pollutant intake — and a "
+        "guidance callout appears.  "
         "Wind penalties: sustained >" f"{WIND_HIGH_MPH} mph, gusts >{GUST_MOD_MPH}/{GUST_HIGH_MPH} mph; "
         "the wind panel shows actual speeds so you can judge effort.  "
         "\u2605 Best ride window = best contiguous block of consensus score, with a "
@@ -1403,7 +1551,8 @@ def methodology_text():
         "below horizon).  Estimates for planning \u2014 check weather.gov for official alerts.")
 
 def methodology_src():
-    return ("Data: Open-Meteo (open-meteo.com), CC BY 4.0; alerts from NWS api.weather.gov.  "
+    return ("Data: Open-Meteo (open-meteo.com), CC BY 4.0, incl. the air-quality API "
+            "(CAMS); alerts from NWS api.weather.gov.  "
             "Models: " + ", ".join(MODELS.values()))
 
 def page_overview(pdf, panel, idx, agg, bullets, date_str, alerts, sun, win=None):
@@ -1862,6 +2011,47 @@ def fig_current(cur, idx, date_str, sun, river=None):
     return fig
 
 
+def fig_aqi(aq, idx, date_str, sun):
+    """Air quality (US EPA AQI) over time against the EPA category bands.
+    Returns None when the forecast doesn't cover this day."""
+    if not aq:
+        return None
+    v = aq["aqi"].reindex(idx).values.astype(float)
+    if np.all(np.isnan(v)):
+        return None
+    fig, ax = plt.subplots(figsize=(11, 3.2))
+    fig.subplots_adjust(left=0.08, right=0.96, top=0.82, bottom=0.22)
+    shade_daylight(ax, sun, idx)
+    ymax = max(float(np.nanmax(v)) * 1.25, AQI_USG + 30)   # always show the USG line
+    lo = 0
+    for hi, lab, col in AQI_BANDS:
+        if lo >= ymax:
+            break
+        top = min(hi, ymax)
+        ax.axhspan(lo, top, color=col, alpha=0.10, lw=0)
+        if top - lo > 0.06 * ymax:
+            ax.text(idx[-1], (lo + top) / 2, f"{lab} ", fontsize=6.4,
+                    color="#555", va="center", ha="right")
+        lo = hi
+    ax.plot(idx, v, color="#343a40", lw=2.2)
+    ok = ~np.isnan(v)
+    ax.scatter(idx[ok], v[ok], c=[aqi_band(x)[1] for x in v[ok]],
+               s=22, zorder=5, edgecolors="#343a40", linewidths=0.5)
+    ip = int(np.nanargmax(v))
+    if v[ip] >= AQI_BANDS[0][0]:               # flat Good days need no callout
+        ax.annotate(f"peak {v[ip]:.0f} ({aqi_band(v[ip])[0]}) ~{hlabel(idx[ip])}",
+                    (idx[ip], v[ip]), xytext=(0, 7), textcoords="offset points",
+                    ha="center", fontsize=7.5, color="#343a40")
+    ax.set_title(f"Air quality forecast (US AQI) — {date_str}", loc="left")
+    ax.set_ylabel("US AQI")
+    ax.set_ylim(0, ymax)
+    ax.set_xlim(idx[0], idx[-1])
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_hax))
+    ax.set_xlabel(f"Hour (local, {TZ})")
+    return fig
+
+
 def page_precip_severe(pdf, panel, idx, agg, date_str, sun):
     fig = fig_conditions(panel, idx, agg, date_str, sun)
     pdf.savefig(fig); plt.close(fig)
@@ -1898,6 +2088,8 @@ def build_aggregates(panel):
         "gust_mean": nanmean0(stack(panel, "gust_ms")),
         "wdir_hourly": wdir_hourly,
         "prevailing_dir": prevailing,
+        "aqi_mean": (nanmean0(stack(panel, "aqi"))
+                     if "aqi" in panel[next(iter(panel))] else None),
         "sc_mean": stack(panel, "score").mean(0),
         "pop_gfs": (panel["gfs_seamless"]["pop"].values
                     if "gfs_seamless" in panel
@@ -1933,6 +2125,9 @@ def main():
     panel = to_panel(js)
     if not panel:
         sys.exit("No model data returned.")
+
+    print("Fetching air-quality forecast ...")
+    attach_aqi(panel, fetch_air_quality())
 
     print("Checking NWS alerts ...")
     alerts = fetch_alerts()

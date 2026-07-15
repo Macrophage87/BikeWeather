@@ -96,6 +96,7 @@ units = _env("BIKE_UNITS", "us")                  # "us" -> degF, mph ; "metric"
 have_light = _envb("BIKE_HAVE_LIGHT", True)        # dark riding ok -> small night penalty only
 ride_hours = _envi("BIKE_RIDE_HOURS", 3)          # length of the headline "best ride window"
 show_alerts = _envb("BIKE_SHOW_ALERTS", True)     # include active NWS alerts
+show_aqi = _envb("BIKE_SHOW_AQI", True)           # include the air-quality (AQI) forecast
 alert_email = _env("BIKE_ALERT_EMAIL", "replace-with-your-email@example.com")
 
 _ph = _envlist("BIKE_PREFERRED_HOURS", [5, 9])    # "5,9" or "none"; [start, end) no-dark window
@@ -131,7 +132,7 @@ bw.configure(
     location_name=location_name, lat=lat, lon=lon, tz=tz,
     forecast_days=forecast_days, units=units, have_light=have_light,
     preferred_hours=preferred_hours, ride_hours=ride_hours, models=models,
-    show_alerts=show_alerts, alert_email=alert_email,
+    show_alerts=show_alerts, alert_email=alert_email, show_aqi=show_aqi,
     mode=mode, usgs_site=usgs_site, water_temp_c=water_temp_c,
     tide_station=tide_station, row_site=row_site,
     channel_width_m=channel_width_m, channel_depth_m=channel_depth_m,
@@ -146,6 +147,12 @@ js = bw.fetch()
 panel = bw.to_panel(js)
 alerts = bw.fetch_alerts() if show_alerts else []
 n_models = len(panel)
+
+# Air quality (US AQI) forecast — attach before the rowing scores so the
+# air-quality penalty lands in both the cycling and rowing ratings.
+aq = bw.fetch_air_quality() if show_aqi else None
+if aq is not None:
+    bw.attach_aqi(panel, aq)
 
 # Which views to render, and the live river conditions for the rowing view.
 bike_on = mode in ("bike", "both")
@@ -202,8 +209,9 @@ print(f"Hour-by-hour cycling conditions for **{location_name}**, comparing "
       f"**{n_models} weather models** (physics + AI) for **{day_names}**. "
       f"Units are {units}.{prof} Each day shows an at-a-glance suitability grid, "
       f"the recommended ride window, a consensus table, and detailed temperature, "
-      f"storm and wind charts \u2014 plus a heat-stress (WBGT) or wind-chill panel "
-      f"on days when heat or cold is a concern.\n")
+      f"storm, wind and air-quality charts \u2014 plus a heat-stress (WBGT), "
+      f"wind-chill or air-quality panel on days when heat, cold or the AQI is "
+      f"a concern.\n")
 ```
 
 ```{python}
@@ -252,6 +260,29 @@ for di_, (d, sub) in enumerate(days):
         print("{{< pagebreak >}}")
         print(":::\n")
     print(f"\n## {label}\n")
+
+    # Air quality — day-level callout (it applies to cycling and rowing alike)
+    # when the forecast reaches "unhealthy for sensitive groups" or worse.
+    af = bw.aqi_flags(didx, aq["aqi"]) if aq is not None else {"concern": False}
+    aqi_fig_path = None
+    if aq is not None:
+        f_aqi = bw.fig_aqi(aq, didx, label, sun)
+        if f_aqi is not None:
+            aqi_fig_path = save(f_aqi, f"aqi_{di_}.png")
+    if af["concern"]:
+        band = af["band"]
+        kind = "warning" if band == "Sensitive groups" else "important"
+        title = ("Air quality — unhealthy for sensitive groups"
+                 if band == "Sensitive groups" else f"Air quality — {band}")
+        win_txt = af["windows"].get(band)
+        span = f"; in that band {win_txt}" if win_txt else ""
+        print(f"::: {{.callout-{kind} title='{title}'}}")
+        print(f"Peak AQI **{af['peak_aqi']:.0f}** ({band}) around "
+              f"{bw.hm(af['peak_hour'])}{span}. The hourly scores below are "
+              f"docked for it.\n")
+        for r in af["recommendations"]:
+            print(f"- {r}")
+        print(":::\n")
 
     both_views = bike_on and row_on
     if both_views:                    # nested tabset: Cycling / Rowing tabs in HTML
@@ -332,6 +363,9 @@ for di_, (d, sub) in enumerate(days):
         print(f"![Temperature, heat stress and UV]({pt}){{width=100%}}\n")
         pc = save(bw.fig_conditions(sub, didx, agg, label, sun), f"cond_{di_}.png")
         print(f"![Precipitation, storms and wind]({pc}){{width=100%}}\n")
+        if aqi_fig_path:
+            print(f"![Air quality (US AQI) against the EPA bands]"
+                  f"({aqi_fig_path}){{width=100%}}\n")
 
     if row_on:
         if both_views:
@@ -364,6 +398,9 @@ for di_, (d, sub) in enumerate(days):
             cpth = save(fcur, f"current_{di_}.png")
             print(f"![Estimated water speed over time \u2014 {bw.ROW_SITE}]"
                   f"({cpth}){{width=100%}}\n")
+        if aqi_fig_path:                     # each tab needs its own copy
+            print(f"![Air quality (US AQI) against the EPA bands]"
+                  f"({aqi_fig_path}){{width=100%}}\n")
 
     if both_views:
         print(":::\n")                # close the nested Cycling/Rowing tabset

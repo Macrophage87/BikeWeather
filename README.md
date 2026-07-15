@@ -161,6 +161,7 @@ repo). Each variable is `BIKE_` + the parameter name in upper case:
 | `BIKE_RIDE_HOURS` | `ride_hours` | `2` |
 | `BIKE_MODELS` | `models` | `gfs_seamless,ecmwf_ifs025`  (or `none` = all) |
 | `BIKE_SHOW_ALERTS` | `show_alerts` | `true` |
+| `BIKE_SHOW_AQI` | `show_aqi` | `true` — include the air-quality (US AQI) forecast |
 | `BIKE_ALERT_EMAIL` | `alert_email` | `you@example.com` |
 | `BIKE_MODE` | `mode` | `both` — `bike`, `row`, or `both` |
 | `BIKE_USGS_SITE` | `usgs_site` | `01646500` (Potomac at DC; rowing) |
@@ -203,6 +204,11 @@ as tabs in the HTML version and as separate pages (one day per page) in the PDF:
    frostbite-risk band, and cold-weather advice, plus a focused chart.
 8. **Temperature, heat stress & UV** and **Precipitation, storms & wind** — the
    detailed multi-panel charts.
+9. **Air quality (US AQI)** — an hourly AQI chart against the EPA category
+   bands, plus a day-level callout with exercise guidance whenever the forecast
+   reaches "unhealthy for sensitive groups" (AQI ≥ 101) or worse. From that
+   band the AQI also subtracts from the cycling *and* rowing scores — hard
+   breathing multiplies pollutant intake.
 
 With `mode` set to `row` or `both`, each day also gets a **Rowing** view
 (singles / small-boat oriented): a rowing conditions heatmap (every model vs the
@@ -237,6 +243,8 @@ Each hour starts at 100 and loses points for:
   hours are capped at "Avoid."
 - **Wind** — sustained speed and gusts.
 - **Cold** — low temperatures.
+- **Air quality** — US EPA AQI from AQI 101 up (sensitive groups → hazardous);
+  the same penalty applies to the rowing score.
 
 Scores map to ratings: **Avoid · Poor · Fair · Good · Excellent**. Full
 thresholds are documented in the report's methodology section and in the
@@ -260,6 +268,8 @@ hour at "Avoid." The live river flow bands are **advisory** — set `ROW_*` and
 
 - **Forecasts:** [Open-Meteo](https://open-meteo.com) (CC BY 4.0) — all models
   through one API.
+- **Air quality:** [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api)
+  (CAMS) — hourly US EPA AQI plus PM2.5 / PM10 / ozone.
 - **Alerts:** US [National Weather Service](https://www.weather.gov)
   (`api.weather.gov`).
 - **River conditions (rowing):** [USGS Water Services](https://waterservices.usgs.gov)
